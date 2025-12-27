@@ -1,0 +1,7 @@
+{
+  "name": "AgencyOS",
+  "description": "AI-powered platform to build and run an automation agency, featuring an intake wizard, workflow catalog, and an AI Council for strategic decision-making.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}

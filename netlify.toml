@@ -1,0 +1,163 @@
+# ============================================
+# AgencyOS - Netlify Configuration
+# ============================================
+# This configuration deploys AgencyOS as a serverless application
+# using Netlify Functions for the backend API.
+#
+# Prerequisites:
+# - Supabase project with schema.sql applied
+# - Environment variables configured in Netlify dashboard
+#
+# Required Environment Variables:
+# - AGENCYOS_DATABASE_URL: PostgreSQL connection string
+# - SUPABASE_URL: Supabase project URL
+# - SUPABASE_ANON_KEY: Supabase anonymous key (for frontend)
+# - SUPABASE_SERVICE_KEY: Supabase service role key (for backend)
+# - OPENROUTER_API_KEY: AI API key (or GEMINI_API_KEY)
+# ============================================
+
+[build]
+  # Build command for the frontend
+  command = "npm run build"
+
+  # Output directory for static files
+  publish = "dist"
+
+  # Directory containing Netlify Functions
+  functions = "netlify/functions"
+
+  # Node.js version
+  [build.environment]
+    NODE_VERSION = "20"
+
+# ============================================
+# REDIRECTS & REWRITES
+# ============================================
+
+# API routes -> Netlify Functions
+[[redirects]]
+  from = "/api/*"
+  to = "/.netlify/functions/api/:splat"
+  status = 200
+  force = true
+
+# SPA fallback - all other routes go to index.html
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
+
+# ============================================
+# HEADERS
+# ============================================
+
+# Security headers
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Frame-Options = "DENY"
+    X-Content-Type-Options = "nosniff"
+    X-XSS-Protection = "1; mode=block"
+    Referrer-Policy = "strict-origin-when-cross-origin"
+    Permissions-Policy = "camera=(), microphone=(), geolocation=()"
+
+# Cache static assets
+[[headers]]
+  for = "/assets/*"
+  [headers.values]
+    Cache-Control = "public, max-age=31536000, immutable"
+
+# Cache fonts
+[[headers]]
+  for = "*.woff2"
+  [headers.values]
+    Cache-Control = "public, max-age=31536000, immutable"
+
+# ============================================
+# FUNCTIONS CONFIGURATION
+# ============================================
+
+[functions]
+  # Use esbuild for faster builds
+  node_bundler = "esbuild"
+
+  # Include external modules
+  external_node_modules = ["pg"]
+
+  # Function timeout (default 10s, max 26s on free tier)
+  # For Pro plan: up to 60s
+  # Note: Council operations use Supabase Edge Functions for longer timeouts
+
+# Specific function configurations
+[functions."api"]
+  # Main API handler with increased timeout
+  # Note: On free tier, max is 26 seconds
+  # Council jobs are handled by Supabase Edge Functions
+  schedule = ""
+
+# ============================================
+# PLUGINS
+# ============================================
+
+# Lighthouse performance audit
+[[plugins]]
+  package = "@netlify/plugin-lighthouse"
+
+  [plugins.inputs]
+    output_path = "reports/lighthouse"
+    audits = [
+      { path = "/", thresholds = { performance = 0.8, accessibility = 0.9 } }
+    ]
+
+# ============================================
+# CONTEXT-SPECIFIC SETTINGS
+# ============================================
+
+# Production settings
+[context.production]
+  command = "npm run build"
+
+  [context.production.environment]
+    NODE_ENV = "production"
+    VITE_API_URL = ""
+
+# Preview/Branch deploy settings
+[context.deploy-preview]
+  command = "npm run build"
+
+  [context.deploy-preview.environment]
+    NODE_ENV = "preview"
+
+# Branch-specific settings (staging)
+[context.staging]
+  command = "npm run build"
+
+  [context.staging.environment]
+    NODE_ENV = "staging"
+
+# ============================================
+# DEV SERVER SETTINGS
+# ============================================
+
+[dev]
+  # Local dev server port
+  port = 8888
+
+  # Target port for frontend dev server
+  targetPort = 5173
+
+  # Auto-launch browser
+  autoLaunch = false
+
+  # Framework detection
+  framework = "vite"
+
+  # Command to start local dev server
+  command = "npm run dev"
+
+  # Function port
+  functionsPort = 9999
+
+  # Environment variables for local development
+  [dev.environment]
+    NODE_ENV = "development"

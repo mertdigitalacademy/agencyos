@@ -1,0 +1,252 @@
+name: agencyos
+
+services:
+  # --- Optional: AgencyOS Postgres (profile: agencyosdb) ---------------------
+  agencyos-db:
+    profiles: ["agencyosdb"]
+    image: postgres:16-alpine
+    container_name: agencyos-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${AGENCYOS_DB_USER:-agencyos}
+      POSTGRES_PASSWORD: ${AGENCYOS_DB_PASSWORD:-agencyos}
+      POSTGRES_DB: ${AGENCYOS_DB_NAME:-agencyos}
+    ports:
+      - "${AGENCYOS_DB_PORT:-5434}:5432"
+    volumes:
+      - agencyos_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${AGENCYOS_DB_USER:-agencyos} -d ${AGENCYOS_DB_NAME:-agencyos}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # --- Core: n8n -------------------------------------------------------------
+  n8n-db:
+    image: postgres:16-alpine
+    container_name: agencyos-n8n-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${N8N_DB_USER:-n8n}
+      POSTGRES_PASSWORD: ${N8N_DB_PASSWORD:-n8n}
+      POSTGRES_DB: ${N8N_DB_NAME:-n8n}
+    ports:
+      - "${N8N_DB_PORT:-5433}:5432"
+    volumes:
+      - n8n_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${N8N_DB_USER:-n8n} -d ${N8N_DB_NAME:-n8n}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: agencyos-n8n
+    restart: unless-stopped
+    depends_on:
+      n8n-db:
+        condition: service_healthy
+    ports:
+      - "${N8N_PORT:-5678}:5678"
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: n8n-db
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: ${N8N_DB_NAME:-n8n}
+      DB_POSTGRESDB_USER: ${N8N_DB_USER:-n8n}
+      DB_POSTGRESDB_PASSWORD: ${N8N_DB_PASSWORD:-n8n}
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:-change-me}
+      N8N_BASIC_AUTH_ACTIVE: "true"
+      N8N_BASIC_AUTH_USER: ${N8N_BASIC_AUTH_USER:-admin}
+      N8N_BASIC_AUTH_PASSWORD: ${N8N_BASIC_AUTH_PASSWORD:-admin}
+      N8N_HOST: ${N8N_HOST:-localhost}
+      N8N_PROTOCOL: ${N8N_PROTOCOL:-http}
+      WEBHOOK_URL: ${N8N_WEBHOOK_URL:-http://localhost:${N8N_PORT:-5678}}
+      N8N_DIAGNOSTICS_ENABLED: "false"
+      N8N_PERSONALIZATION_ENABLED: "false"
+    volumes:
+      - n8n_data:/home/node/.n8n
+
+  # --- Optional: Infisical (profile: infisical) ------------------------------
+  infisical-db:
+    profiles: ["infisical"]
+    image: postgres:14-alpine
+    container_name: agencyos-infisical-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${INFISICAL_POSTGRES_PASSWORD:-infisical}
+      POSTGRES_USER: ${INFISICAL_POSTGRES_USER:-infisical}
+      POSTGRES_DB: ${INFISICAL_POSTGRES_DB:-infisical}
+    volumes:
+      - infisical_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready --username=${INFISICAL_POSTGRES_USER:-infisical} && psql --username=${INFISICAL_POSTGRES_USER:-infisical} --list",
+        ]
+      interval: 5s
+      timeout: 10s
+      retries: 10
+
+  infisical-redis:
+    profiles: ["infisical"]
+    image: redis:7-alpine
+    container_name: agencyos-infisical-redis
+    restart: unless-stopped
+    command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
+    volumes:
+      - infisical_redis_data:/data
+
+  infisical:
+    profiles: ["infisical"]
+    image: infisical/infisical:latest
+    container_name: agencyos-infisical
+    restart: unless-stopped
+    depends_on:
+      infisical-db:
+        condition: service_healthy
+      infisical-redis:
+        condition: service_started
+    ports:
+      - "${INFISICAL_PORT:-8081}:8080"
+    environment:
+      NODE_ENV: production
+      ENCRYPTION_KEY: ${INFISICAL_ENCRYPTION_KEY:-f13dbc92aaaf86fa7cb0ed8ac3265f47}
+      AUTH_SECRET: ${INFISICAL_AUTH_SECRET:-5lrMXKKWCVocS/uerPsl7V+TX/aaUaI7iDkgl3tSmLE=}
+      POSTGRES_PASSWORD: ${INFISICAL_POSTGRES_PASSWORD:-infisical}
+      POSTGRES_USER: ${INFISICAL_POSTGRES_USER:-infisical}
+      POSTGRES_DB: ${INFISICAL_POSTGRES_DB:-infisical}
+      DB_CONNECTION_URI: postgres://${INFISICAL_POSTGRES_USER:-infisical}:${INFISICAL_POSTGRES_PASSWORD:-infisical}@infisical-db:5432/${INFISICAL_POSTGRES_DB:-infisical}
+      REDIS_URL: redis://infisical-redis:6379
+      SITE_URL: ${INFISICAL_SITE_URL:-http://localhost:${INFISICAL_PORT:-8081}}
+
+  # --- Optional: InvoiceShelf (profile: invoiceshelf) -------------------------
+  invoiceshelf:
+    profiles: ["invoiceshelf"]
+    container_name: agencyos-invoiceshelf
+    build:
+      context: ../external/invoiceshelf
+      dockerfile: docker/production/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "${INVOICESHELF_PORT:-8090}:8080"
+    environment:
+      APP_NAME: InvoiceShelf
+      APP_ENV: production
+      APP_DEBUG: "false"
+      APP_URL: ${INVOICESHELF_APP_URL:-http://localhost:${INVOICESHELF_PORT:-8090}}
+      DB_CONNECTION: sqlite
+      DB_DATABASE: /var/www/html/storage/app/database.sqlite
+      CACHE_STORE: file
+      SESSION_DRIVER: file
+      SESSION_LIFETIME: 240
+      SESSION_DOMAIN: localhost
+      SANCTUM_STATEFUL_DOMAINS: localhost:${INVOICESHELF_PORT:-8090}
+    volumes:
+      - invoiceshelf_storage:/var/www/html/storage
+
+  # --- Optional: Documenso (profile: documenso) --------------------------------
+  documenso-db:
+    profiles: ["documenso"]
+    image: postgres:15-alpine
+    container_name: agencyos-documenso-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DOCUMENSO_POSTGRES_USER:-documenso}
+      POSTGRES_PASSWORD: ${DOCUMENSO_POSTGRES_PASSWORD:-documenso}
+      POSTGRES_DB: ${DOCUMENSO_POSTGRES_DB:-documenso}
+    volumes:
+      - documenso_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DOCUMENSO_POSTGRES_USER:-documenso} -d ${DOCUMENSO_POSTGRES_DB:-documenso}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  documenso:
+    profiles: ["documenso"]
+    image: documenso/documenso:latest
+    container_name: agencyos-documenso
+    restart: unless-stopped
+    depends_on:
+      documenso-db:
+        condition: service_healthy
+      mailhog:
+        condition: service_started
+    ports:
+      - "${DOCUMENSO_PORT:-8092}:${DOCUMENSO_PORT:-8092}"
+    environment:
+      PORT: ${DOCUMENSO_PORT:-8092}
+      NEXTAUTH_SECRET: ${DOCUMENSO_NEXTAUTH_SECRET:-change-me}
+      NEXT_PRIVATE_ENCRYPTION_KEY: ${DOCUMENSO_ENCRYPTION_KEY:-change-me-change-me-change-me-32chars}
+      NEXT_PRIVATE_ENCRYPTION_SECONDARY_KEY: ${DOCUMENSO_ENCRYPTION_SECONDARY_KEY:-change-me-change-me-change-me-32chars}
+      NEXT_PUBLIC_WEBAPP_URL: ${DOCUMENSO_WEBAPP_URL:-http://localhost:${DOCUMENSO_PORT:-8092}}
+      NEXT_PRIVATE_INTERNAL_WEBAPP_URL: ${DOCUMENSO_INTERNAL_WEBAPP_URL:-http://documenso:${DOCUMENSO_PORT:-8092}}
+      NEXT_PRIVATE_DATABASE_URL: postgres://${DOCUMENSO_POSTGRES_USER:-documenso}:${DOCUMENSO_POSTGRES_PASSWORD:-documenso}@documenso-db:5432/${DOCUMENSO_POSTGRES_DB:-documenso}
+      NEXT_PRIVATE_DIRECT_DATABASE_URL: postgres://${DOCUMENSO_POSTGRES_USER:-documenso}:${DOCUMENSO_POSTGRES_PASSWORD:-documenso}@documenso-db:5432/${DOCUMENSO_POSTGRES_DB:-documenso}
+      NEXT_PRIVATE_SMTP_TRANSPORT: ${DOCUMENSO_SMTP_TRANSPORT:-smtp-auth}
+      NEXT_PRIVATE_SMTP_HOST: ${DOCUMENSO_SMTP_HOST:-mailhog}
+      NEXT_PRIVATE_SMTP_PORT: ${DOCUMENSO_SMTP_PORT:-1025}
+      NEXT_PRIVATE_SMTP_SECURE: ${DOCUMENSO_SMTP_SECURE:-false}
+      NEXT_PRIVATE_SMTP_UNSAFE_IGNORE_TLS: ${DOCUMENSO_SMTP_UNSAFE_IGNORE_TLS:-true}
+      NEXT_PRIVATE_SMTP_USERNAME: ${DOCUMENSO_SMTP_USERNAME:-}
+      NEXT_PRIVATE_SMTP_PASSWORD: ${DOCUMENSO_SMTP_PASSWORD:-}
+      NEXT_PRIVATE_SMTP_FROM_NAME: ${DOCUMENSO_SMTP_FROM_NAME:-AgencyOS}
+      NEXT_PRIVATE_SMTP_FROM_ADDRESS: ${DOCUMENSO_SMTP_FROM_ADDRESS:-no-reply@example.com}
+      NEXT_PRIVATE_SIGNING_PASSPHRASE: ${DOCUMENSO_SIGNING_PASSPHRASE:-change-me}
+    volumes:
+      - ${DOCUMENSO_CERT_PATH:-../data/certs/documenso/cert.p12}:/opt/documenso/cert.p12:ro
+
+  mailhog:
+    profiles: ["documenso"]
+    image: mailhog/mailhog:latest
+    container_name: agencyos-mailhog
+    restart: unless-stopped
+    ports:
+      - "${MAILHOG_SMTP_PORT:-1025}:1025"
+      - "${MAILHOG_UI_PORT:-8025}:8025"
+
+  # --- Optional: SuiteCRM (profile: suitecrm) ---------------------------------
+  suitecrm-db:
+    profiles: ["suitecrm"]
+    image: mariadb:11
+    container_name: agencyos-suitecrm-db
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: ${SUITECRM_DB_ROOT_PASSWORD:-suitecrmroot}
+      MARIADB_DATABASE: ${SUITECRM_DB_NAME:-suitecrm}
+      MARIADB_USER: ${SUITECRM_DB_USER:-suitecrm}
+      MARIADB_PASSWORD: ${SUITECRM_DB_PASSWORD:-suitecrm}
+    volumes:
+      - suitecrm_db_data:/var/lib/mysql
+
+  suitecrm:
+    profiles: ["suitecrm"]
+    image: bitnami/suitecrm:latest
+    container_name: agencyos-suitecrm
+    restart: unless-stopped
+    depends_on:
+      - suitecrm-db
+    ports:
+      - "${SUITECRM_PORT:-8091}:8080"
+    environment:
+      SUITECRM_DATABASE_HOST: suitecrm-db
+      SUITECRM_DATABASE_PORT_NUMBER: 3306
+      SUITECRM_DATABASE_NAME: ${SUITECRM_DB_NAME:-suitecrm}
+      SUITECRM_DATABASE_USER: ${SUITECRM_DB_USER:-suitecrm}
+      SUITECRM_DATABASE_PASSWORD: ${SUITECRM_DB_PASSWORD:-suitecrm}
+      SUITECRM_USERNAME: ${SUITECRM_ADMIN_USER:-admin}
+      SUITECRM_PASSWORD: ${SUITECRM_ADMIN_PASSWORD:-admin}
+      SUITECRM_EMAIL: ${SUITECRM_ADMIN_EMAIL:-admin@example.com}
+
+volumes:
+  agencyos_db_data:
+  n8n_db_data:
+  n8n_data:
+  infisical_pg_data:
+  infisical_redis_data:
+  invoiceshelf_storage:
+  documenso_db_data:
+  suitecrm_db_data:

@@ -1,0 +1,18 @@
+[submodule "external/llm-council"]
+	path = external/llm-council
+	url = https://github.com/karpathy/llm-council
+[submodule "external/n8n-workflows"]
+	path = external/n8n-workflows
+	url = https://github.com/Zie619/n8n-workflows
+[submodule "external/invoiceshelf"]
+	path = external/invoiceshelf
+	url = https://github.com/InvoiceShelf/InvoiceShelf
+[submodule "external/suitecrm"]
+	path = external/suitecrm
+	url = https://github.com/SuiteCRM/SuiteCRM
+[submodule "external/documenso"]
+	path = external/documenso
+	url = https://github.com/documenso/documenso
+[submodule "external/infisical"]
+	path = external/infisical
+	url = https://github.com/Infisical/infisical

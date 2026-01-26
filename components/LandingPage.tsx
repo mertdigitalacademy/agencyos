@@ -1,13 +1,16 @@
 
 import React from 'react';
+import { useI18n } from '../services/i18n';
 
 interface LandingPageProps {
   onEnter: () => void;
 }
 
 const LandingPage: React.FC<LandingPageProps> = ({ onEnter }) => {
+  const { language, setLanguage, tt } = useI18n();
+
   return (
-    <div className="min-h-screen bg-[#020617] text-slate-200 overflow-hidden relative">
+    <div className="min-h-screen bg-slate-950 text-slate-200 overflow-hidden relative">
       {/* Background Gradients */}
       <div className="absolute top-0 left-0 w-full h-full pointer-events-none">
         <div className="absolute top-[-10%] left-[-10%] w-[50%] h-[50%] bg-blue-600/10 blur-[120px] rounded-full"></div>
@@ -20,13 +23,26 @@ const LandingPage: React.FC<LandingPageProps> = ({ onEnter }) => {
           <span className="text-2xl font-bold text-white tracking-tighter uppercase">AgencyOS</span>
         </div>
         <div className="flex items-center gap-8">
-          <a href="#" className="text-sm font-medium text-slate-400 hover:text-white transition-colors">Vision</a>
-          <a href="#" className="text-sm font-medium text-slate-400 hover:text-white transition-colors">Docs</a>
+          <a href="#" className="text-sm font-medium text-slate-400 hover:text-white transition-colors">{tt('Vision', 'Vizyon')}</a>
+          <a href="#" className="text-sm font-medium text-slate-400 hover:text-white transition-colors">{tt('Docs', 'Dokümanlar')}</a>
+          <div className="flex bg-slate-900/50 rounded-full p-1 border border-slate-800">
+            {(['tr', 'en'] as const).map((l) => (
+              <button
+                key={l}
+                onClick={() => setLanguage(l)}
+                className={`px-4 py-2 rounded-full text-[11px] font-bold transition-all ${
+                  language === l ? 'bg-slate-800 text-white shadow-xl' : 'text-slate-400 hover:text-white'
+                }`}
+              >
+                {l === 'tr' ? 'TR' : 'EN'}
+              </button>
+            ))}
+          </div>
           <button 
             onClick={onEnter}
-            className="bg-white text-slate-950 px-6 py-2.5 rounded-full font-bold text-sm hover:bg-slate-200 transition-all shadow-xl"
+            className="bg-white text-slate-200 px-6 py-2.5 rounded-full font-bold text-sm hover:bg-slate-900 transition-all shadow-xl border border-slate-800"
           >
-            Launch Platform
+            {tt('Launch Platform', 'Platforma Gir')}
           </button>
         </div>
       </nav>
@@ -37,16 +53,21 @@ const LandingPage: React.FC<LandingPageProps> = ({ onEnter }) => {
             <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75"></span>
             <span className="relative inline-flex rounded-full h-2 w-2 bg-blue-500"></span>
           </span>
-          Next Gen Agency OS v1.0
+          {tt('Next Gen Agency OS v1.0', 'Yeni Nesil Ajans OS v1.0')}
         </div>
         
         <h1 className="text-6xl md:text-8xl font-black text-white tracking-tight mb-8 leading-[1.1] animate-in fade-in slide-in-from-bottom duration-1000">
-          Automate Your Agency.<br />
-          <span className="text-transparent bg-clip-text bg-gradient-to-r from-blue-400 via-indigo-400 to-purple-400">Scale Without Headcount.</span>
+          {tt('Automate Your Agency.', 'Ajansını Otomatikleştir.') }<br />
+          <span className="text-transparent bg-clip-text bg-gradient-to-r from-blue-400 via-indigo-400 to-purple-400">
+            {tt('Scale Without Headcount.', 'Ekip Büyütmeden Ölçekle.')}
+          </span>
         </h1>
         
         <p className="max-w-2xl text-xl text-slate-400 mb-12 leading-relaxed animate-in fade-in slide-in-from-bottom duration-1000 delay-200">
-          The all-in-one platform for AI automation agencies. From intake to implementation, let Gemini and n8n run your core operations while you focus on high-level growth.
+          {tt(
+            'The all-in-one platform for AI-powered agencies. From intake to implementation, let AI + n8n run operations while you focus on growth.',
+            'AI destekli ajanslar için hepsi bir arada platform. Intake’tan kuruluma kadar AI + n8n operasyonu yürütür; sen büyümeye odaklanırsın.',
+          )}
         </p>
 
         <div className="flex gap-4 animate-in fade-in slide-in-from-bottom duration-1000 delay-300">
@@ -54,10 +75,10 @@ const LandingPage: React.FC<LandingPageProps> = ({ onEnter }) => {
             onClick={onEnter}
             className="bg-blue-600 hover:bg-blue-700 text-white px-10 py-5 rounded-2xl font-bold text-lg shadow-2xl shadow-blue-600/30 transition-all flex items-center gap-3 active:scale-95"
           >
-            Enter Control Room 🚀
+            {tt('Enter Control Room', 'Kontrol Odasına Gir')} 🚀
           </button>
           <button className="bg-slate-800 hover:bg-slate-700 text-white px-10 py-5 rounded-2xl font-bold text-lg border border-slate-700 transition-all">
-            Watch Demo
+            {tt('Watch Demo', 'Demo İzle')}
           </button>
         </div>
 

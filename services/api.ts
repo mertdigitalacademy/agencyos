@@ -23,6 +23,7 @@ import type {
   WorkflowCandidate,
   Workflow,
 } from "../types";
+import { getAuthHeader } from "../src/lib/supabase";
 
 async function apiJson<T>(path: string, init?: RequestInit, opts?: { timeoutMs?: number }): Promise<T> {
   const controller = opts?.timeoutMs ? new AbortController() : null;
@@ -30,10 +31,12 @@ async function apiJson<T>(path: string, init?: RequestInit, opts?: { timeoutMs?:
     ? setTimeout(() => controller?.abort(), Math.max(1000, opts.timeoutMs))
     : null;
 
+  const authHeaders = await getAuthHeader();
+
   let res: Response;
   try {
     res = await fetch(path, {
-      headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
+      headers: { "Content-Type": "application/json", ...authHeaders, ...(init?.headers ?? {}) },
       ...init,
       signal: init?.signal ?? controller?.signal,
     });

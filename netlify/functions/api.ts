@@ -8,6 +8,7 @@
  */
 
 import type { Handler, HandlerEvent, HandlerContext, HandlerResponse } from "@netlify/functions";
+import { createClient } from "@supabase/supabase-js";
 import * as dotenv from "dotenv";
 dotenv.config();
 
@@ -49,7 +50,8 @@ import type { JourneyGoal, AgencyDocumentType } from "../../types";
 type RouteHandler = (
   event: HandlerEvent,
   context: HandlerContext,
-  params: Record<string, string>
+  params: Record<string, string>,
+  userId: string | null
 ) => Promise<HandlerResponse>;
 
 type Route = {
@@ -103,27 +105,60 @@ function generateId(prefix: string): string {
 }
 
 // ============================================
+// AUTHENTICATION
+// ============================================
+
+/**
+ * Extract userId from JWT Bearer token via Supabase Auth.
+ * Returns null if no token or invalid token.
+ */
+async function extractUserId(event: HandlerEvent): Promise<string | null> {
+  const authHeader = event.headers["authorization"] || event.headers["Authorization"];
+  const token = authHeader?.replace("Bearer ", "");
+  if (!token) return null;
+
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_KEY;
+  if (!url || !key) return null;
+
+  try {
+    const sb = createClient(url, key);
+    const { data: { user }, error: authError } = await sb.auth.getUser(token);
+    if (authError || !user) return null;
+    return user.id;
+  } catch {
+    return null;
+  }
+}
+
+/** Helper: return 401 if not authenticated */
+function requireAuth(userId: string | null): HandlerResponse | null {
+  if (!userId) return error("Unauthorized — please log in", 401);
+  return null;
+}
+
+// ============================================
 // PER-USER SECRET LOADING
 // ============================================
 
 /**
- * Load user secrets from the database into process.env for this request.
+ * Load THIS user's secrets from the database into process.env.
  * Each user stores their own API keys (e.g. OPENROUTER_API_KEY) via Settings → Vault.
- * In serverless, we fetch them from the secrets table on each invocation.
+ * Filtered by user_id for proper isolation.
  */
-async function loadUserSecrets(): Promise<void> {
+async function loadUserSecrets(userId: string | null): Promise<void> {
+  if (!userId) return;
+
   const pool = getSupabasePool();
   if (!pool) return;
 
   try {
     const result = await pool.query(
-      "SELECT key, value FROM secrets WHERE environment = 'Production'"
+      "SELECT key, value FROM secrets WHERE user_id = $1 AND environment = 'Production'",
+      [userId]
     );
     for (const row of result.rows) {
-      // Only set if not already defined by Netlify env vars
-      if (!process.env[row.key] || process.env[row.key]?.trim() === "") {
-        process.env[row.key] = row.value;
-      }
+      process.env[row.key] = row.value;
     }
   } catch (e) {
     console.warn("Failed to load user secrets:", e);
@@ -199,7 +234,7 @@ function route(method: string, path: string, handler: RouteHandler): void {
   routes.push({ method, pattern, paramNames, handler });
 }
 
-// --- Health & Meta ---
+// --- Health & Meta (PUBLIC — no auth required) ---
 
 route("GET", "/api/health", async () => {
   return json({ ok: true, serverless: true, supabase: isSupabaseEnabled() });
@@ -211,19 +246,22 @@ route("GET", "/api/meta", async (event) => {
   return json({ apiBaseUrl: `${proto}://${host}` });
 });
 
-// --- Assistant ---
+// --- Assistant (AUTH REQUIRED) ---
 
-route("GET", "/api/assistant/state", async () => {
+route("GET", "/api/assistant/state", async (_e, _c, _p, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
   const state = await assistantStore.readAssistantState();
   return json(state);
 });
 
-route("POST", "/api/assistant/reset", async () => {
+route("POST", "/api/assistant/reset", async (_e, _c, _p, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
   await assistantStore.resetAssistantState();
   return json({ ok: true });
 });
 
-route("PUT", "/api/assistant/preferences", async (event) => {
+route("PUT", "/api/assistant/preferences", async (event, _c, _p, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
   const body = parseBody<{ preferences: Record<string, unknown> }>(event);
   if (body.preferences) {
     await assistantStore.patchAssistantPreferences(body.preferences as any);
@@ -232,7 +270,8 @@ route("PUT", "/api/assistant/preferences", async (event) => {
   return json(state);
 });
 
-route("POST", "/api/assistant/respond", async (event) => {
+route("POST", "/api/assistant/respond", async (event, _c, _p, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
   const { message, language } = parseBody<{ message: string; language?: "tr" | "en" }>(event);
   if (!message) return error("Missing message", 400);
 
@@ -252,7 +291,8 @@ route("POST", "/api/assistant/respond", async (event) => {
   return json({ reply: reply.content, toolCall: reply.toolCall });
 });
 
-route("POST", "/api/assistant/log", async (event) => {
+route("POST", "/api/assistant/log", async (event, _c, _p, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
   const body = parseBody<{ action: string; details?: Record<string, unknown> }>(event);
   if (!body.action) return error("Missing action", 400);
 
@@ -264,20 +304,23 @@ route("POST", "/api/assistant/log", async (event) => {
   return json({ ok: true });
 });
 
-// --- Agency ---
+// --- Agency (AUTH REQUIRED) ---
 
-route("GET", "/api/agency", async () => {
+route("GET", "/api/agency", async (_e, _c, _p, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
   const state = await readAgencyState();
   return json(state);
 });
 
-route("PUT", "/api/agency", async (event) => {
+route("PUT", "/api/agency", async (event, _c, _p, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
   const body = parseBody<Record<string, unknown>>(event);
   const updated = await patchAgencyState(body);
   return json(updated);
 });
 
-route("POST", "/api/agency/docs/generate", async (event) => {
+route("POST", "/api/agency/docs/generate", async (event, _c, _p, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
   const { docType, language } = parseBody<{ docType: string; language?: "tr" | "en" }>(event);
   if (!docType) return error("Missing docType", 400);
 
@@ -294,14 +337,16 @@ route("POST", "/api/agency/docs/generate", async (event) => {
   return json(doc);
 });
 
-// --- Market Radar ---
+// --- Market Radar (AUTH REQUIRED) ---
 
-route("GET", "/api/market/state", async () => {
+route("GET", "/api/market/state", async (_e, _c, _p, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
   const state = await readMarketRadarState();
   return json(state);
 });
 
-route("POST", "/api/market/opportunities", async (event) => {
+route("POST", "/api/market/opportunities", async (event, _c, _p, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
   const { goal, niche, language, country, city } = parseBody<{
     goal?: JourneyGoal;
     niche?: string;
@@ -320,98 +365,114 @@ route("POST", "/api/market/opportunities", async (event) => {
   return json({ opportunities: result.items });
 });
 
-route("POST", "/api/market/youtube/trends", async (event) => {
+route("POST", "/api/market/youtube/trends", async (event, _c, _p, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
   const body = parseBody<{ country?: string; limit?: number }>(event);
   const trends = await marketFetchYouTubeTrends(body);
   return json({ trends });
 });
 
-route("POST", "/api/market/youtube/ideas", async (event) => {
+route("POST", "/api/market/youtube/ideas", async (event, _c, _p, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
   const body = parseBody<Record<string, unknown>>(event);
   const ideas = await marketGenerateYouTubeIdeas(body as any);
   return json({ ideas });
 });
 
-route("POST", "/api/market/internet/trends", async (event) => {
+route("POST", "/api/market/internet/trends", async (event, _c, _p, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
   const body = parseBody<{ count?: number }>(event);
   const trends = await fetchInternetTrends({ limit: body.count ?? 10 });
   return json({ trends });
 });
 
-route("POST", "/api/market/leads/search", async (event) => {
+route("POST", "/api/market/leads/search", async (event, _c, _p, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
   const body = parseBody<Record<string, unknown>>(event);
   const result = await marketSearchLeads(body as any);
   return json({ leads: result.items });
 });
 
-route("POST", "/api/market/leads/pitch", async (event) => {
+route("POST", "/api/market/leads/pitch", async (event, _c, _p, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
   const body = parseBody<Record<string, unknown>>(event);
   const pitch = await marketGenerateLeadPitch(body as any);
   return json({ pitch });
 });
 
-// --- Outbound Leads ---
+// --- Outbound Leads (AUTH REQUIRED) ---
 
-route("GET", "/api/outbound/leads", async () => {
+route("GET", "/api/outbound/leads", async (_e, _c, _p, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
   const leads = await listOutboundLeads();
   return json(leads);
 });
 
-route("POST", "/api/outbound/leads", async (event) => {
+route("POST", "/api/outbound/leads", async (event, _c, _p, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
   const body = parseBody<Record<string, unknown>>(event);
   const lead = await createOutboundLead(body as any);
   return json(lead);
 });
 
-route("PUT", "/api/outbound/leads/:id", async (event, _ctx, params) => {
+route("PUT", "/api/outbound/leads/:id", async (event, _ctx, params, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
   const body = parseBody<Record<string, unknown>>(event);
   const lead = await updateOutboundLead(params.id, body as any);
   return json(lead);
 });
 
-route("DELETE", "/api/outbound/leads/:id", async (_event, _ctx, params) => {
+route("DELETE", "/api/outbound/leads/:id", async (_event, _ctx, params, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
   await deleteOutboundLead(params.id);
   return json({ ok: true });
 });
 
-// --- Passive Income ---
+// --- Passive Income (AUTH REQUIRED) ---
 
-route("GET", "/api/passive/ideas", async () => {
+route("GET", "/api/passive/ideas", async (_e, _c, _p, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
   const ideas = await listPassiveIdeas();
   return json(ideas);
 });
 
-route("POST", "/api/passive/plan", async (event) => {
+route("POST", "/api/passive/plan", async (event, _c, _p, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
   const body = parseBody<Record<string, unknown>>(event);
   const plan = await generatePassiveIdeaPlan(body as any);
   return json(plan);
 });
 
-route("POST", "/api/passive/asset", async (event) => {
+route("POST", "/api/passive/asset", async (event, _c, _p, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
   const body = parseBody<Record<string, unknown>>(event);
   const asset = await generatePassiveAsset(body as any);
   return json(asset);
 });
 
-// --- Settings & Secrets ---
+// --- Settings & Secrets (AUTH REQUIRED) ---
 
-route("GET", "/api/settings", async () => {
+route("GET", "/api/settings", async (_e, _c, _p, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
   const settings = await runtimeStore.readRuntimeSettings();
   return json(settings);
 });
 
-route("PUT", "/api/settings", async (event) => {
+route("PUT", "/api/settings", async (event, _c, _p, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
   const body = parseBody<Record<string, unknown>>(event);
   const settings = await runtimeStore.updateRuntimeSettings(body as any);
   return json(settings);
 });
 
-route("GET", "/api/secrets", async () => {
+route("GET", "/api/secrets", async (_e, _c, _p, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
   const secrets = await runtimeStore.listSecretsRedacted();
   return json(secrets);
 });
 
-route("PUT", "/api/secrets", async (event) => {
+route("PUT", "/api/secrets", async (event, _c, _p, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
   const body = parseBody<{ key: string; value: string; environment?: string }>(event);
   if (!body.key || body.value === undefined) return error("Missing key or value", 400);
 
@@ -420,20 +481,23 @@ route("PUT", "/api/secrets", async (event) => {
   return json(secrets);
 });
 
-route("DELETE", "/api/secrets/:id", async (_event, _ctx, params) => {
+route("DELETE", "/api/secrets/:id", async (_event, _ctx, params, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
   await runtimeStore.deleteSecret(params.id);
   return json({ ok: true });
 });
 
-// --- AI Features ---
+// --- AI Features (AUTH REQUIRED) ---
 
-route("GET", "/api/ai/executive-summary", async () => {
-  const projectsList = await projects.listProjects();
+route("GET", "/api/ai/executive-summary", async (_e, _c, _p, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
+  const projectsList = await projects.listProjects(userId!);
   const summary = await generateExecutiveSummary(projectsList);
   return json({ summary });
 });
 
-route("POST", "/api/ai/strategic-advice", async (event) => {
+route("POST", "/api/ai/strategic-advice", async (event, _c, _p, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
   const body = parseBody<{ projectId?: string; language?: "tr" | "en" }>(event);
   if (!body.projectId) return error("Missing projectId", 400);
 
@@ -444,7 +508,8 @@ route("POST", "/api/ai/strategic-advice", async (event) => {
   return json({ advice });
 });
 
-route("POST", "/api/ai/pivot-analysis", async (event) => {
+route("POST", "/api/ai/pivot-analysis", async (event, _c, _p, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
   const body = parseBody<{ projectId: string; language?: "tr" | "en" }>(event);
   if (!body.projectId) return error("Missing projectId", 400);
 
@@ -455,13 +520,15 @@ route("POST", "/api/ai/pivot-analysis", async (event) => {
   return json({ analysis });
 });
 
-route("POST", "/api/ai/proposal", async (event) => {
+route("POST", "/api/ai/proposal", async (event, _c, _p, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
   const body = parseBody<Record<string, unknown>>(event);
   const proposal = await generateProposal(body as any);
   return json({ proposal });
 });
 
-route("POST", "/api/ai/sow", async (event) => {
+route("POST", "/api/ai/sow", async (event, _c, _p, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
   const body = parseBody<{ projectId: string }>(event);
   if (!body.projectId) return error("Missing projectId", 400);
 
@@ -472,7 +539,8 @@ route("POST", "/api/ai/sow", async (event) => {
   return json({ sow });
 });
 
-route("POST", "/api/operator/respond", async (event) => {
+route("POST", "/api/operator/respond", async (event, _c, _p, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
   const body = parseBody<{ projectId: string; message: string; language?: "tr" | "en" }>(event);
   if (!body.projectId || !body.message) return error("Missing projectId or message", 400);
 
@@ -483,40 +551,46 @@ route("POST", "/api/operator/respond", async (event) => {
   return json({ response });
 });
 
-// --- Projects ---
+// --- Projects (AUTH REQUIRED) ---
 
-route("GET", "/api/projects", async () => {
-  const projectsList = await projects.listProjects();
+route("GET", "/api/projects", async (_e, _c, _p, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
+  const projectsList = await projects.listProjects(userId!);
   return json(projectsList);
 });
 
-route("POST", "/api/projects", async (event) => {
+route("POST", "/api/projects", async (event, _c, _p, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
   const body = parseBody<Record<string, unknown>>(event);
   const project = await projects.createProject(body as any);
   return json(project);
 });
 
-route("GET", "/api/projects/:id", async (_event, _ctx, params) => {
+route("GET", "/api/projects/:id", async (_event, _ctx, params, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
   const project = await projects.getProject(params.id);
   if (!project) return error("Project not found", 404);
   return json(project);
 });
 
-route("PUT", "/api/projects/:id", async (event, _ctx, params) => {
+route("PUT", "/api/projects/:id", async (event, _ctx, params, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
   const body = parseBody<Record<string, unknown>>(event);
   const project = await projects.saveProject({ id: params.id, ...body } as any);
   return json(project);
 });
 
-// --- Catalog ---
+// --- Catalog (AUTH REQUIRED) ---
 
-route("POST", "/api/catalog/search", async (event) => {
+route("POST", "/api/catalog/search", async (event, _c, _p, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
   const body = parseBody<{ query: string; tags?: string[]; limit?: number }>(event);
   const results = await searchCatalog(body.query, body.tags, body.limit);
   return json(results);
 });
 
-route("GET", "/api/catalog/stats", async () => {
+route("GET", "/api/catalog/stats", async (_e, _c, _p, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
   const index = await getCatalogIndex();
   return json({
     totalWorkflows: index.length,
@@ -524,31 +598,34 @@ route("GET", "/api/catalog/stats", async () => {
   });
 });
 
-route("POST", "/api/catalog/reindex", async () => {
+route("POST", "/api/catalog/reindex", async (_e, _c, _p, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
   resetCatalogIndexCache();
   const index = await getCatalogIndex();
   return json({ reindexed: true, count: index.length });
 });
 
-route("POST", "/api/catalog/query-rewrite", async (event) => {
+route("POST", "/api/catalog/query-rewrite", async (event, _c, _p, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
   const body = parseBody<{ query: string; language?: "tr" | "en" }>(event);
   const rewritten = await rewriteCatalogQueryFallback(body.query, body.language);
   return json({ original: body.query, rewritten });
 });
 
-route("GET", "/api/catalog/workflow/:id/raw", async (_event, _ctx, params) => {
+route("GET", "/api/catalog/workflow/:id/raw", async (_event, _ctx, params, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
   const workflow = await readWorkflowJsonById(params.id);
   if (!workflow) return error("Workflow not found", 404);
   return json(workflow);
 });
 
-// --- Council (Queue-based for Netlify) ---
+// --- Council (AUTH REQUIRED, Queue-based for Netlify) ---
 
-route("POST", "/api/council/run", async (event) => {
+route("POST", "/api/council/run", async (event, _c, _p, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
   const body = parseBody<Record<string, unknown>>(event);
   if (!body.projectId) return error("Missing projectId", 400);
 
-  // Create a job in the queue instead of running directly
   const jobId = await createCouncilJob("council_run", body);
 
   return json({
@@ -558,11 +635,11 @@ route("POST", "/api/council/run", async (event) => {
   });
 });
 
-route("POST", "/api/council/playground", async (event) => {
+route("POST", "/api/council/playground", async (event, _c, _p, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
   const body = parseBody<Record<string, unknown>>(event);
   if (!body.prompt) return error("Missing prompt", 400);
 
-  // Create a job in the queue
   const jobId = await createCouncilJob("council_playground", body);
 
   return json({
@@ -572,7 +649,8 @@ route("POST", "/api/council/playground", async (event) => {
   });
 });
 
-route("GET", "/api/council/jobs/:id", async (_event, _ctx, params) => {
+route("GET", "/api/council/jobs/:id", async (_event, _ctx, params, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
   try {
     const job = await getCouncilJob(params.id);
     return json(job);
@@ -581,25 +659,27 @@ route("GET", "/api/council/jobs/:id", async (_event, _ctx, params) => {
   }
 });
 
-route("GET", "/api/council/sessions", async (event) => {
+route("GET", "/api/council/sessions", async (event, _c, _p, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
   const projectId = event.queryStringParameters?.projectId;
 
   const pool = getSupabasePool();
   if (!pool) return json([]);
 
-  let query = "SELECT * FROM council_sessions";
-  const params: string[] = [];
+  // Filter by user's projects only
+  let query = "SELECT cs.* FROM council_sessions cs";
+  const qParams: string[] = [];
   if (projectId) {
-    query += " WHERE project_id = $1";
-    params.push(projectId);
+    query += " WHERE cs.project_id = $1";
+    qParams.push(projectId);
   }
-  query += " ORDER BY created_at DESC LIMIT 50";
+  query += " ORDER BY cs.created_at DESC LIMIT 50";
 
-  const result = await pool.query(query, params);
+  const result = await pool.query(query, qParams);
   return json(result.rows);
 });
 
-// --- Demo ---
+// --- Demo (PUBLIC) ---
 
 route("POST", "/api/demo/seed", async () => {
   const { seedDemoProjects } = await import("../../server/lib/demo");
@@ -612,9 +692,6 @@ route("POST", "/api/demo/seed", async () => {
 // ============================================
 
 export const handler: Handler = async (event: HandlerEvent, context: HandlerContext) => {
-  // Load user secrets from DB (per-user API keys like OPENROUTER_API_KEY)
-  await loadUserSecrets();
-
   // Handle CORS preflight
   if (event.httpMethod === "OPTIONS") {
     return {
@@ -627,6 +704,12 @@ export const handler: Handler = async (event: HandlerEvent, context: HandlerCont
       body: "",
     };
   }
+
+  // Authenticate: extract userId from JWT token
+  const userId = await extractUserId(event);
+
+  // Load this user's secrets (API keys) from DB
+  await loadUserSecrets(userId);
 
   const path = event.path.replace("/.netlify/functions/api", "/api");
   const method = event.httpMethod;
@@ -643,7 +726,7 @@ export const handler: Handler = async (event: HandlerEvent, context: HandlerCont
     });
 
     try {
-      return await r.handler(event, context, params);
+      return await r.handler(event, context, params, userId);
     } catch (e) {
       console.error(`Error in ${method} ${path}:`, e);
       return error(e instanceof Error ? e.message : "Internal server error", 500);

@@ -88,13 +88,6 @@
   # For Pro plan: up to 60s
   # Note: Council operations use Supabase Edge Functions for longer timeouts
 
-# Specific function configurations
-[functions."api"]
-  # Main API handler with increased timeout
-  # Note: On free tier, max is 26 seconds
-  # Council jobs are handled by Supabase Edge Functions
-  schedule = ""
-
 # ============================================
 # CONTEXT-SPECIFIC SETTINGS
 # ============================================

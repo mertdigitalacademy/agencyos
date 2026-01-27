@@ -1275,11 +1275,15 @@ export async function saveMarketRadarState(state: MarketRadarState, userId?: str
 // RUNTIME SETTINGS
 // ============================================
 
-export async function getRuntimeSettings(): Promise<RuntimeSettings | null> {
+export async function getRuntimeSettings(userId?: string): Promise<RuntimeSettings | null> {
   const p = getSupabasePool();
   if (!p) throw new Error("Database not connected");
 
-  const result = await p.query("SELECT * FROM runtime_settings WHERE id = 'default' LIMIT 1");
+  const query = userId
+    ? "SELECT * FROM runtime_settings WHERE user_id = $1 LIMIT 1"
+    : "SELECT * FROM runtime_settings WHERE user_id IS NULL LIMIT 1";
+  const params = userId ? [userId] : [];
+  const result = await p.query(query, params);
   if (result.rows.length === 0) return null;
 
   const row = result.rows[0];
@@ -1301,17 +1305,18 @@ export async function getRuntimeSettings(): Promise<RuntimeSettings | null> {
   };
 }
 
-export async function saveRuntimeSettings(settings: RuntimeSettings): Promise<void> {
+export async function saveRuntimeSettings(settings: RuntimeSettings, userId?: string): Promise<void> {
   const p = getSupabasePool();
   if (!p) throw new Error("Database not connected");
 
+  const id = userId ?? "default";
   await p.query(
     `INSERT INTO runtime_settings (
-       id, active_environment, n8n_base_url, suitecrm_base_url, invoiceshelf_base_url,
+       id, user_id, active_environment, n8n_base_url, suitecrm_base_url, invoiceshelf_base_url,
        documenso_base_url, infisical_base_url, infisical_workspace_id, infisical_secret_path,
        infisical_env_development_slug, infisical_env_staging_slug, infisical_env_production_slug,
        council_models, council_chairman_model, council_stage2_enabled, updated_at
-     ) VALUES ('default', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW())
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, NOW())
      ON CONFLICT (id) DO UPDATE SET
        active_environment = EXCLUDED.active_environment,
        n8n_base_url = EXCLUDED.n8n_base_url,
@@ -1329,6 +1334,8 @@ export async function saveRuntimeSettings(settings: RuntimeSettings): Promise<vo
        council_stage2_enabled = EXCLUDED.council_stage2_enabled,
        updated_at = NOW()`,
     [
+      id,
+      userId ?? null,
       settings.activeEnvironment,
       settings.n8nBaseUrl,
       settings.suitecrmBaseUrl,
@@ -1351,11 +1358,15 @@ export async function saveRuntimeSettings(settings: RuntimeSettings): Promise<vo
 // SECRETS
 // ============================================
 
-export async function listSecrets(): Promise<StoredSecret[]> {
+export async function listSecrets(userId?: string): Promise<StoredSecret[]> {
   const p = getSupabasePool();
   if (!p) throw new Error("Database not connected");
 
-  const result = await p.query("SELECT * FROM secrets ORDER BY last_updated DESC");
+  const query = userId
+    ? "SELECT * FROM secrets WHERE user_id = $1 ORDER BY last_updated DESC"
+    : "SELECT * FROM secrets ORDER BY last_updated DESC";
+  const params = userId ? [userId] : [];
+  const result = await p.query(query, params);
   return result.rows.map((row) => ({
     id: String(row.id),
     key: String(row.key),
@@ -1365,7 +1376,7 @@ export async function listSecrets(): Promise<StoredSecret[]> {
   }));
 }
 
-export async function upsertSecret(secret: Omit<StoredSecret, "lastUpdated"> & { lastUpdated?: string }): Promise<StoredSecret> {
+export async function upsertSecret(secret: Omit<StoredSecret, "lastUpdated"> & { lastUpdated?: string }, userId?: string): Promise<StoredSecret> {
   const p = getSupabasePool();
   if (!p) throw new Error("Database not connected");
 
@@ -1373,14 +1384,14 @@ export async function upsertSecret(secret: Omit<StoredSecret, "lastUpdated"> & {
   const id = secret.id ?? generateId("sec");
 
   await p.query(
-    `INSERT INTO secrets (id, key, value, environment, last_updated)
-     VALUES ($1, $2, $3, $4, $5)
+    `INSERT INTO secrets (id, key, value, environment, last_updated, user_id)
+     VALUES ($1, $2, $3, $4, $5, $6)
      ON CONFLICT (id) DO UPDATE SET
        key = EXCLUDED.key,
        value = EXCLUDED.value,
        environment = EXCLUDED.environment,
        last_updated = EXCLUDED.last_updated`,
-    [id, secret.key, secret.value, secret.environment, secret.lastUpdated ?? now]
+    [id, secret.key, secret.value, secret.environment, secret.lastUpdated ?? now, userId ?? null]
   );
 
   return {
@@ -1392,11 +1403,15 @@ export async function upsertSecret(secret: Omit<StoredSecret, "lastUpdated"> & {
   };
 }
 
-export async function deleteSecret(secretId: string): Promise<void> {
+export async function deleteSecret(secretId: string, userId?: string): Promise<void> {
   const p = getSupabasePool();
   if (!p) throw new Error("Database not connected");
 
-  await p.query("DELETE FROM secrets WHERE id = $1", [secretId]);
+  const query = userId
+    ? "DELETE FROM secrets WHERE id = $1 AND user_id = $2"
+    : "DELETE FROM secrets WHERE id = $1";
+  const params = userId ? [secretId, userId] : [secretId];
+  await p.query(query, params);
 }
 
 // ============================================

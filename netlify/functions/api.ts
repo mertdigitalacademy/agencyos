@@ -5,6 +5,9 @@
  * For long-running operations (Council meetings), it creates jobs in the
  * council_jobs table and returns immediately. The Supabase Edge Function
  * (council-worker) processes these jobs asynchronously.
+ *
+ * MULTI-TENANCY: Every authenticated route passes userId to storage functions
+ * to ensure per-user data isolation.
  */
 
 import type { Handler, HandlerEvent, HandlerContext, HandlerResponse } from "@netlify/functions";
@@ -13,14 +16,29 @@ import * as dotenv from "dotenv";
 dotenv.config();
 
 // Import storage and handlers
-import { isSupabaseEnabled, getSupabasePool } from "../../server/lib/supabaseStorage";
-import * as projects from "../../server/lib/projects";
-import * as assistantStore from "../../server/lib/assistantStore";
-import * as runtimeStore from "../../server/lib/runtimeStore";
-import { generateAssistantReply } from "../../server/lib/assistant";
-import { readAgencyState, patchAgencyState, addAgencyDocument } from "../../server/lib/agency";
 import {
-  readMarketRadarState,
+  isSupabaseEnabled,
+  getSupabasePool,
+  // Per-user storage functions (all accept userId)
+  listOutboundLeads as dbListOutboundLeads,
+  saveOutboundLead as dbSaveOutboundLead,
+  deleteOutboundLead as dbDeleteOutboundLead,
+  getAssistantState as dbGetAssistantState,
+  saveAssistantState as dbSaveAssistantState,
+  getAgencyState as dbGetAgencyState,
+  saveAgencyState as dbSaveAgencyState,
+  getMarketRadarState as dbGetMarketRadarState,
+  getRuntimeSettings as dbGetRuntimeSettings,
+  saveRuntimeSettings as dbSaveRuntimeSettings,
+  listSecrets as dbListSecrets,
+  upsertSecret as dbUpsertSecret,
+  deleteSecret as dbDeleteSecret,
+  createCouncilJob as dbCreateCouncilJob,
+  getCouncilJob as dbGetCouncilJob,
+} from "../../server/lib/supabaseStorage";
+import * as projects from "../../server/lib/projects";
+import { generateAssistantReply } from "../../server/lib/assistant";
+import {
   marketGenerateOpportunities,
   marketFetchYouTubeTrends,
   marketGenerateYouTubeIdeas,
@@ -28,7 +46,6 @@ import {
   marketGenerateLeadPitch,
 } from "../../server/lib/marketRadar";
 import { fetchInternetTrends } from "../../server/lib/internetTrends";
-import { listOutboundLeads, createOutboundLead, updateOutboundLead, deleteOutboundLead } from "../../server/lib/outbound";
 import { listPassiveIdeas, generatePassiveIdeaPlan, generatePassiveAsset } from "../../server/lib/passiveIncome";
 import {
   generateExecutiveSummary,
@@ -41,7 +58,8 @@ import {
 } from "../../server/lib/ai";
 import { getCatalogIndex, searchCatalog, readWorkflowJsonById, resetCatalogIndexCache } from "../../server/lib/catalog";
 import { rewriteCatalogQueryFallback } from "../../server/lib/queryRewrite";
-import type { JourneyGoal, AgencyDocumentType } from "../../types";
+import type { JourneyGoal, AgencyDocumentType, AssistantState, AssistantMessage } from "../../types";
+import type { RuntimeSettings, EnvironmentName } from "../../server/lib/runtimeStore";
 
 // ============================================
 // TYPES
@@ -102,6 +120,10 @@ function pathToRegex(path: string): { pattern: RegExp; paramNames: string[] } {
 
 function generateId(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function nowIso(): string {
+  return new Date().toISOString();
 }
 
 // ============================================
@@ -166,60 +188,43 @@ async function loadUserSecrets(userId: string | null): Promise<void> {
 }
 
 // ============================================
-// COUNCIL QUEUE SYSTEM
+// DEFAULT STATES (for reset/init)
 // ============================================
 
-async function createCouncilJob(
-  jobType: "council_run" | "council_playground" | "doc_generate",
-  input: Record<string, unknown>
-): Promise<string> {
-  const pool = getSupabasePool();
-  if (!pool) {
-    throw new Error("Database not connected - cannot create council job");
-  }
-
-  const projectId = input.projectId ? String(input.projectId) : null;
-
-  const result = await pool.query(
-    `INSERT INTO council_jobs (job_type, status, input, progress, project_id, created_at)
-     VALUES ($1, 'pending', $2, 0, $3, NOW())
-     RETURNING id`,
-    [jobType, JSON.stringify(input), projectId]
-  );
-
-  return result.rows[0].id;
+function defaultAssistantState(): AssistantState {
+  const now = nowIso();
+  return {
+    id: "assistant-default",
+    preferences: {},
+    messages: [
+      {
+        id: "msg-welcome",
+        role: "system",
+        content:
+          "You are the AgencyOS Global Assistant. Keep answers actionable, and use tool calls when helpful. Never request secrets.",
+        createdAt: now,
+      },
+    ],
+    updatedAt: now,
+  };
 }
 
-async function getCouncilJob(jobId: string): Promise<{
-  id: string;
-  jobType: string;
-  status: string;
-  progress: number;
-  result: unknown;
-  error?: string;
-}> {
-  const pool = getSupabasePool();
-  if (!pool) {
-    throw new Error("Database not connected");
-  }
-
-  const result = await pool.query(
-    "SELECT id, job_type, status, progress, result, error FROM council_jobs WHERE id = $1",
-    [jobId]
-  );
-
-  if (result.rows.length === 0) {
-    throw new Error("Job not found");
-  }
-
-  const row = result.rows[0];
+function defaultRuntimeSettings(): RuntimeSettings {
   return {
-    id: row.id,
-    jobType: row.job_type,
-    status: row.status,
-    progress: row.progress,
-    result: row.result,
-    error: row.error,
+    activeEnvironment: "Production" as EnvironmentName,
+    n8nBaseUrl: "http://localhost:5678",
+    suitecrmBaseUrl: "http://localhost:8091",
+    invoiceshelfBaseUrl: "http://localhost:8090",
+    documensoBaseUrl: "http://localhost:8092",
+    infisicalBaseUrl: "http://localhost:8081",
+    infisicalWorkspaceId: "",
+    infisicalSecretPath: "/",
+    infisicalEnvDevelopmentSlug: "dev",
+    infisicalEnvStagingSlug: "staging",
+    infisicalEnvProductionSlug: "prod",
+    councilModels: "openai/gpt-5-mini, anthropic/claude-sonnet-4, google/gemini-2.5-flash",
+    councilChairmanModel: "openai/gpt-5-mini",
+    councilStage2Enabled: false,
   };
 }
 
@@ -250,24 +255,30 @@ route("GET", "/api/meta", async (event) => {
 
 route("GET", "/api/assistant/state", async (_e, _c, _p, userId) => {
   const deny = requireAuth(userId); if (deny) return deny;
-  const state = await assistantStore.readAssistantState();
-  return json(state);
+  const state = await dbGetAssistantState(userId!);
+  return json(state ?? defaultAssistantState());
 });
 
 route("POST", "/api/assistant/reset", async (_e, _c, _p, userId) => {
   const deny = requireAuth(userId); if (deny) return deny;
-  await assistantStore.resetAssistantState();
+  await dbSaveAssistantState(defaultAssistantState(), userId!);
   return json({ ok: true });
 });
 
 route("PUT", "/api/assistant/preferences", async (event, _c, _p, userId) => {
   const deny = requireAuth(userId); if (deny) return deny;
   const body = parseBody<{ preferences: Record<string, unknown> }>(event);
+  const current = await dbGetAssistantState(userId!) ?? defaultAssistantState();
   if (body.preferences) {
-    await assistantStore.patchAssistantPreferences(body.preferences as any);
+    const merged: AssistantState = {
+      ...current,
+      preferences: { ...current.preferences, ...body.preferences } as any,
+      updatedAt: nowIso(),
+    };
+    await dbSaveAssistantState(merged, userId!);
+    return json(merged);
   }
-  const state = await assistantStore.readAssistantState();
-  return json(state);
+  return json(current);
 });
 
 route("POST", "/api/assistant/respond", async (event, _c, _p, userId) => {
@@ -276,17 +287,28 @@ route("POST", "/api/assistant/respond", async (event, _c, _p, userId) => {
   if (!message) return error("Missing message", 400);
 
   const reply = await generateAssistantReply(message, language);
-  await assistantStore.appendAssistantMessage({
+
+  // Append messages to user's assistant state
+  const current = await dbGetAssistantState(userId!) ?? defaultAssistantState();
+  const userMsg: AssistantMessage = {
     id: generateId("msg"),
     role: "user",
     content: message,
-  });
-  await assistantStore.appendAssistantMessage({
+    createdAt: nowIso(),
+  };
+  const assistantMsg: AssistantMessage = {
     id: generateId("msg"),
     role: "assistant",
     content: reply.content,
     toolCall: reply.toolCall,
-  });
+    createdAt: nowIso(),
+  };
+  const next: AssistantState = {
+    ...current,
+    messages: [...current.messages, userMsg, assistantMsg].slice(-300),
+    updatedAt: nowIso(),
+  };
+  await dbSaveAssistantState(next, userId!);
 
   return json({ reply: reply.content, toolCall: reply.toolCall });
 });
@@ -296,11 +318,19 @@ route("POST", "/api/assistant/log", async (event, _c, _p, userId) => {
   const body = parseBody<{ action: string; details?: Record<string, unknown> }>(event);
   if (!body.action) return error("Missing action", 400);
 
-  await assistantStore.appendAssistantMessage({
+  const current = await dbGetAssistantState(userId!) ?? defaultAssistantState();
+  const sysMsg: AssistantMessage = {
     id: generateId("msg"),
     role: "system",
     content: `[${body.action}] ${body.details ? JSON.stringify(body.details) : ""}`,
-  });
+    createdAt: nowIso(),
+  };
+  const next: AssistantState = {
+    ...current,
+    messages: [...current.messages, sysMsg].slice(-300),
+    updatedAt: nowIso(),
+  };
+  await dbSaveAssistantState(next, userId!);
   return json({ ok: true });
 });
 
@@ -308,15 +338,17 @@ route("POST", "/api/assistant/log", async (event, _c, _p, userId) => {
 
 route("GET", "/api/agency", async (_e, _c, _p, userId) => {
   const deny = requireAuth(userId); if (deny) return deny;
-  const state = await readAgencyState();
-  return json(state);
+  const state = await dbGetAgencyState(userId!);
+  return json(state ?? {});
 });
 
 route("PUT", "/api/agency", async (event, _c, _p, userId) => {
   const deny = requireAuth(userId); if (deny) return deny;
   const body = parseBody<Record<string, unknown>>(event);
-  const updated = await patchAgencyState(body);
-  return json(updated);
+  const current = await dbGetAgencyState(userId!) ?? {};
+  const merged = { ...current, ...body, updatedAt: nowIso() };
+  await dbSaveAgencyState(merged as any, userId!);
+  return json(merged);
 });
 
 route("POST", "/api/agency/docs/generate", async (event, _c, _p, userId) => {
@@ -324,25 +356,31 @@ route("POST", "/api/agency/docs/generate", async (event, _c, _p, userId) => {
   const { docType, language } = parseBody<{ docType: string; language?: "tr" | "en" }>(event);
   if (!docType) return error("Missing docType", 400);
 
-  const state = await readAgencyState();
+  const state = await dbGetAgencyState(userId!) ?? {} as any;
   const content = await generateAgencyDocument({
     type: docType as AgencyDocumentType,
     goal: state.goal,
   });
-  const doc = await addAgencyDocument({
-    type: docType as AgencyDocumentType,
+  // Append document to agency state
+  const docs = Array.isArray(state.documents) ? state.documents : [];
+  const newDoc = {
+    id: generateId("doc"),
+    type: docType,
     name: docType,
     content,
-  });
-  return json(doc);
+    createdAt: nowIso(),
+  };
+  const updated = { ...state, documents: [...docs, newDoc], updatedAt: nowIso() };
+  await dbSaveAgencyState(updated as any, userId!);
+  return json(newDoc);
 });
 
 // --- Market Radar (AUTH REQUIRED) ---
 
 route("GET", "/api/market/state", async (_e, _c, _p, userId) => {
   const deny = requireAuth(userId); if (deny) return deny;
-  const state = await readMarketRadarState();
-  return json(state);
+  const state = await dbGetMarketRadarState(userId!);
+  return json(state ?? {});
 });
 
 route("POST", "/api/market/opportunities", async (event, _c, _p, userId) => {
@@ -404,27 +442,27 @@ route("POST", "/api/market/leads/pitch", async (event, _c, _p, userId) => {
 
 route("GET", "/api/outbound/leads", async (_e, _c, _p, userId) => {
   const deny = requireAuth(userId); if (deny) return deny;
-  const leads = await listOutboundLeads();
+  const leads = await dbListOutboundLeads(userId!);
   return json(leads);
 });
 
 route("POST", "/api/outbound/leads", async (event, _c, _p, userId) => {
   const deny = requireAuth(userId); if (deny) return deny;
   const body = parseBody<Record<string, unknown>>(event);
-  const lead = await createOutboundLead(body as any);
+  const lead = await dbSaveOutboundLead(body as any, userId!);
   return json(lead);
 });
 
 route("PUT", "/api/outbound/leads/:id", async (event, _ctx, params, userId) => {
   const deny = requireAuth(userId); if (deny) return deny;
   const body = parseBody<Record<string, unknown>>(event);
-  const lead = await updateOutboundLead(params.id, body as any);
+  const lead = await dbSaveOutboundLead({ id: params.id, ...body } as any, userId!);
   return json(lead);
 });
 
 route("DELETE", "/api/outbound/leads/:id", async (_event, _ctx, params, userId) => {
   const deny = requireAuth(userId); if (deny) return deny;
-  await deleteOutboundLead(params.id);
+  await dbDeleteOutboundLead(params.id, userId!);
   return json({ ok: true });
 });
 
@@ -454,21 +492,29 @@ route("POST", "/api/passive/asset", async (event, _c, _p, userId) => {
 
 route("GET", "/api/settings", async (_e, _c, _p, userId) => {
   const deny = requireAuth(userId); if (deny) return deny;
-  const settings = await runtimeStore.readRuntimeSettings();
-  return json(settings);
+  const settings = await dbGetRuntimeSettings(userId!);
+  return json(settings ?? defaultRuntimeSettings());
 });
 
 route("PUT", "/api/settings", async (event, _c, _p, userId) => {
   const deny = requireAuth(userId); if (deny) return deny;
-  const body = parseBody<Record<string, unknown>>(event);
-  const settings = await runtimeStore.updateRuntimeSettings(body as any);
-  return json(settings);
+  const body = parseBody<Partial<RuntimeSettings>>(event);
+  const current = await dbGetRuntimeSettings(userId!) ?? defaultRuntimeSettings();
+  const merged: RuntimeSettings = { ...current, ...body };
+  await dbSaveRuntimeSettings(merged, userId!);
+  return json(merged);
 });
 
 route("GET", "/api/secrets", async (_e, _c, _p, userId) => {
   const deny = requireAuth(userId); if (deny) return deny;
-  const secrets = await runtimeStore.listSecretsRedacted();
-  return json(secrets);
+  const secrets = await dbListSecrets(userId!);
+  // Redact values
+  const redacted = secrets.map((s) => ({
+    ...s,
+    value: "••••••••••••••••",
+    hasValue: true,
+  }));
+  return json(redacted);
 });
 
 route("PUT", "/api/secrets", async (event, _c, _p, userId) => {
@@ -476,14 +522,28 @@ route("PUT", "/api/secrets", async (event, _c, _p, userId) => {
   const body = parseBody<{ key: string; value: string; environment?: string }>(event);
   if (!body.key || body.value === undefined) return error("Missing key or value", 400);
 
-  await runtimeStore.upsertSecret(body.key, body.value, body.environment as any);
-  const secrets = await runtimeStore.listSecretsRedacted();
-  return json(secrets);
+  await dbUpsertSecret(
+    {
+      id: generateId("sec"),
+      key: body.key.trim().toUpperCase(),
+      value: body.value,
+      environment: (body.environment as EnvironmentName) ?? "Production",
+    },
+    userId!
+  );
+  // Return updated list (redacted)
+  const secrets = await dbListSecrets(userId!);
+  const redacted = secrets.map((s) => ({
+    ...s,
+    value: "••••••••••••••••",
+    hasValue: true,
+  }));
+  return json(redacted);
 });
 
 route("DELETE", "/api/secrets/:id", async (_event, _ctx, params, userId) => {
   const deny = requireAuth(userId); if (deny) return deny;
-  await runtimeStore.deleteSecret(params.id);
+  await dbDeleteSecret(params.id, userId!);
   return json({ ok: true });
 });
 
@@ -501,7 +561,7 @@ route("POST", "/api/ai/strategic-advice", async (event, _c, _p, userId) => {
   const body = parseBody<{ projectId?: string; language?: "tr" | "en" }>(event);
   if (!body.projectId) return error("Missing projectId", 400);
 
-  const project = await projects.getProject(body.projectId);
+  const project = await projects.getProject(body.projectId, userId!);
   if (!project) return error("Project not found", 404);
 
   const advice = await generateStrategicAdvice(project);
@@ -513,7 +573,7 @@ route("POST", "/api/ai/pivot-analysis", async (event, _c, _p, userId) => {
   const body = parseBody<{ projectId: string; language?: "tr" | "en" }>(event);
   if (!body.projectId) return error("Missing projectId", 400);
 
-  const project = await projects.getProject(body.projectId);
+  const project = await projects.getProject(body.projectId, userId!);
   if (!project) return error("Project not found", 404);
 
   const analysis = await analyzeStrategicPivot(project, body.language);
@@ -532,7 +592,7 @@ route("POST", "/api/ai/sow", async (event, _c, _p, userId) => {
   const body = parseBody<{ projectId: string }>(event);
   if (!body.projectId) return error("Missing projectId", 400);
 
-  const project = await projects.getProject(body.projectId);
+  const project = await projects.getProject(body.projectId, userId!);
   if (!project) return error("Project not found", 404);
 
   const sow = await generateSow(project);
@@ -544,7 +604,7 @@ route("POST", "/api/operator/respond", async (event, _c, _p, userId) => {
   const body = parseBody<{ projectId: string; message: string; language?: "tr" | "en" }>(event);
   if (!body.projectId || !body.message) return error("Missing projectId or message", 400);
 
-  const project = await projects.getProject(body.projectId);
+  const project = await projects.getProject(body.projectId, userId!);
   if (!project) return error("Project not found", 404);
 
   const response = await getOperatorResponse(project, body.message, body.language);
@@ -562,13 +622,13 @@ route("GET", "/api/projects", async (_e, _c, _p, userId) => {
 route("POST", "/api/projects", async (event, _c, _p, userId) => {
   const deny = requireAuth(userId); if (deny) return deny;
   const body = parseBody<Record<string, unknown>>(event);
-  const project = await projects.createProject(body as any);
+  const project = await projects.createProject(body as any, userId!);
   return json(project);
 });
 
 route("GET", "/api/projects/:id", async (_event, _ctx, params, userId) => {
   const deny = requireAuth(userId); if (deny) return deny;
-  const project = await projects.getProject(params.id);
+  const project = await projects.getProject(params.id, userId!);
   if (!project) return error("Project not found", 404);
   return json(project);
 });
@@ -576,7 +636,7 @@ route("GET", "/api/projects/:id", async (_event, _ctx, params, userId) => {
 route("PUT", "/api/projects/:id", async (event, _ctx, params, userId) => {
   const deny = requireAuth(userId); if (deny) return deny;
   const body = parseBody<Record<string, unknown>>(event);
-  const project = await projects.saveProject({ id: params.id, ...body } as any);
+  const project = await projects.saveProject({ id: params.id, ...body } as any, userId!);
   return json(project);
 });
 
@@ -626,7 +686,7 @@ route("POST", "/api/council/run", async (event, _c, _p, userId) => {
   const body = parseBody<Record<string, unknown>>(event);
   if (!body.projectId) return error("Missing projectId", 400);
 
-  const jobId = await createCouncilJob("council_run", body);
+  const jobId = await dbCreateCouncilJob("council_run", body, userId!, body.projectId ? String(body.projectId) : undefined);
 
   return json({
     jobId,
@@ -640,7 +700,7 @@ route("POST", "/api/council/playground", async (event, _c, _p, userId) => {
   const body = parseBody<Record<string, unknown>>(event);
   if (!body.prompt) return error("Missing prompt", 400);
 
-  const jobId = await createCouncilJob("council_playground", body);
+  const jobId = await dbCreateCouncilJob("council_playground", body, userId!);
 
   return json({
     jobId,
@@ -652,7 +712,7 @@ route("POST", "/api/council/playground", async (event, _c, _p, userId) => {
 route("GET", "/api/council/jobs/:id", async (_event, _ctx, params, userId) => {
   const deny = requireAuth(userId); if (deny) return deny;
   try {
-    const job = await getCouncilJob(params.id);
+    const job = await dbGetCouncilJob(params.id, userId!);
     return json(job);
   } catch (e) {
     return error(e instanceof Error ? e.message : "Job not found", 404);
@@ -666,11 +726,13 @@ route("GET", "/api/council/sessions", async (event, _c, _p, userId) => {
   const pool = getSupabasePool();
   if (!pool) return json([]);
 
-  // Filter by user's projects only
-  let query = "SELECT cs.* FROM council_sessions cs";
-  const qParams: string[] = [];
+  // Filter by user's projects only via JOIN
+  let query = `SELECT cs.* FROM council_sessions cs
+    JOIN projects p ON cs.project_id = p.id
+    WHERE p.user_id = $1`;
+  const qParams: string[] = [userId!];
   if (projectId) {
-    query += " WHERE cs.project_id = $1";
+    query += " AND cs.project_id = $2";
     qParams.push(projectId);
   }
   query += " ORDER BY cs.created_at DESC LIMIT 50";

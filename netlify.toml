@@ -96,20 +96,6 @@
   schedule = ""
 
 # ============================================
-# PLUGINS
-# ============================================
-
-# Lighthouse performance audit
-[[plugins]]
-  package = "@netlify/plugin-lighthouse"
-
-  [plugins.inputs]
-    output_path = "reports/lighthouse"
-    audits = [
-      { path = "/", thresholds = { performance = 0.8, accessibility = 0.9 } }
-    ]
-
-# ============================================
 # CONTEXT-SPECIFIC SETTINGS
 # ============================================
 

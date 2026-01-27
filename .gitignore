@@ -29,3 +29,6 @@ data/
 
 # Local Netlify folder
 .netlify
+
+# External submodules (not needed for build)
+external/

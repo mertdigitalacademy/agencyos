@@ -18,7 +18,7 @@
 
 [build]
   # Build command for the frontend
-  command = "npm run build"
+  command = "npm ci && npm run build"
 
   # Output directory for static files
   publish = "dist"
@@ -94,7 +94,7 @@
 
 # Production settings
 [context.production]
-  command = "npm run build"
+  command = "npm ci && npm run build"
 
   [context.production.environment]
     NODE_ENV = "production"
@@ -102,14 +102,14 @@
 
 # Preview/Branch deploy settings
 [context.deploy-preview]
-  command = "npm run build"
+  command = "npm ci && npm run build"
 
   [context.deploy-preview.environment]
     NODE_ENV = "preview"
 
 # Branch-specific settings (staging)
 [context.staging]
-  command = "npm run build"
+  command = "npm ci && npm run build"
 
   [context.staging.environment]
     NODE_ENV = "staging"

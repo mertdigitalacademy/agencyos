@@ -103,6 +103,34 @@ function generateId(prefix: string): string {
 }
 
 // ============================================
+// PER-USER SECRET LOADING
+// ============================================
+
+/**
+ * Load user secrets from the database into process.env for this request.
+ * Each user stores their own API keys (e.g. OPENROUTER_API_KEY) via Settings → Vault.
+ * In serverless, we fetch them from the secrets table on each invocation.
+ */
+async function loadUserSecrets(): Promise<void> {
+  const pool = getSupabasePool();
+  if (!pool) return;
+
+  try {
+    const result = await pool.query(
+      "SELECT key, value FROM secrets WHERE environment = 'Production'"
+    );
+    for (const row of result.rows) {
+      // Only set if not already defined by Netlify env vars
+      if (!process.env[row.key] || process.env[row.key]?.trim() === "") {
+        process.env[row.key] = row.value;
+      }
+    }
+  } catch (e) {
+    console.warn("Failed to load user secrets:", e);
+  }
+}
+
+// ============================================
 // COUNCIL QUEUE SYSTEM
 // ============================================
 
@@ -584,6 +612,9 @@ route("POST", "/api/demo/seed", async () => {
 // ============================================
 
 export const handler: Handler = async (event: HandlerEvent, context: HandlerContext) => {
+  // Load user secrets from DB (per-user API keys like OPENROUTER_API_KEY)
+  await loadUserSecrets();
+
   // Handle CORS preflight
   if (event.httpMethod === "OPTIONS") {
     return {

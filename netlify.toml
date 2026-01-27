@@ -8,12 +8,16 @@
 # - Supabase project with schema.sql applied
 # - Environment variables configured in Netlify dashboard
 #
-# Required Environment Variables:
+# Required Environment Variables (set in Netlify Dashboard):
 # - AGENCYOS_DATABASE_URL: PostgreSQL connection string
 # - SUPABASE_URL: Supabase project URL
-# - SUPABASE_ANON_KEY: Supabase anonymous key (for frontend)
 # - SUPABASE_SERVICE_KEY: Supabase service role key (for backend)
-# - OPENROUTER_API_KEY: AI API key (or GEMINI_API_KEY)
+# - VITE_SUPABASE_URL: Supabase URL (for frontend build)
+# - VITE_SUPABASE_ANON_KEY: Supabase anonymous key (for frontend build)
+#
+# Per-user API keys (NOT set here — users add via Settings → Vault):
+# - OPENROUTER_API_KEY
+# - GEMINI_API_KEY
 # ============================================
 
 [build]

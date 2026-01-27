@@ -36,8 +36,6 @@ export interface AuthContextType {
   // Actions
   signIn: (email: string, password: string) => Promise<void>;
   signUp: (email: string, password: string, name?: string) => Promise<void>;
-  signInWithGoogle: () => Promise<void>;
-  signInWithGitHub: () => Promise<void>;
   signOut: () => Promise<void>;
   resetPassword: (email: string) => Promise<void>;
 
@@ -150,32 +148,6 @@ export function AuthProvider({ children }: AuthProviderProps) {
     }
   }, []);
 
-  // Sign in with Google
-  const signInWithGoogle = useCallback(async () => {
-    setError(null);
-
-    try {
-      await auth.signInWithProvider("google");
-    } catch (e) {
-      const message = e instanceof Error ? e.message : "Google sign in failed";
-      setError(message);
-      throw e;
-    }
-  }, []);
-
-  // Sign in with GitHub
-  const signInWithGitHub = useCallback(async () => {
-    setError(null);
-
-    try {
-      await auth.signInWithProvider("github");
-    } catch (e) {
-      const message = e instanceof Error ? e.message : "GitHub sign in failed";
-      setError(message);
-      throw e;
-    }
-  }, []);
-
   // Sign out
   const signOut = useCallback(async () => {
     setError(null);
@@ -212,8 +184,6 @@ export function AuthProvider({ children }: AuthProviderProps) {
     isSupabaseEnabled: isSupabaseConfigured,
     signIn,
     signUp,
-    signInWithGoogle,
-    signInWithGitHub,
     signOut,
     resetPassword,
     error,

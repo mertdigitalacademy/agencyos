@@ -3,6 +3,7 @@ import { ProjectBrief } from '../types';
 import { analyzeIntake } from '../services/api';
 import { INDUSTRY_PRESETS } from '../services/industry';
 import { useI18n } from '../services/i18n';
+import { getAuthHeader } from '../src/lib/supabase';
 import { CouncilBadge } from './CouncilBadge';
 import {
   quickCouncilReview,
@@ -176,9 +177,10 @@ const IntakeWizard: React.FC<IntakeWizardProps> = ({ onComplete, initialValue })
 
                         // Auto-analyze visual
                         try {
+                          const authHeaders = await getAuthHeader();
                           const response = await fetch('/api/intake/analyze-visual', {
                             method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
+                            headers: { 'Content-Type': 'application/json', ...authHeaders },
                             body: JSON.stringify({
                               file: base64.split(',')[1], // Remove data:image/...;base64, prefix
                               mimeType: file.type

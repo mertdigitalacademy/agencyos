@@ -741,9 +741,10 @@ route("GET", "/api/council/sessions", async (event, _c, _p, userId) => {
   return json(result.rows);
 });
 
-// --- Demo (PUBLIC) ---
+// --- Demo ---
 
-route("POST", "/api/demo/seed", async () => {
+route("POST", "/api/demo/seed", async (_e, _c, _p, userId) => {
+  const deny = requireAuth(userId); if (deny) return deny;
   const { seedDemoProjects } = await import("../../server/lib/demo");
   await seedDemoProjects();
   return json({ ok: true });

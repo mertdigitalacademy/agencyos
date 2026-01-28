@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useI18n } from '../services/i18n';
+import { getAuthHeader } from '../src/lib/supabase';
 import SectorExplorer, { SECTORS } from './SectorExplorer';
 import NicheDiscovery from './NicheDiscovery';
 import PostDeployWizard from './PostDeployWizard';
@@ -122,9 +123,10 @@ export default function AgencyBuilder({ onClose, onSolutionDeployed, onNavigate 
     setStep('solution');
 
     try {
+      const authHeaders = await getAuthHeader();
       const response = await fetch('/api/agency-builder/generate-solution', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHeaders },
         body: JSON.stringify({
           sectorId,
           sectorName: getLocalized(sectorName, 'en'),
@@ -207,9 +209,10 @@ export default function AgencyBuilder({ onClose, onSolutionDeployed, onNavigate 
         const workflow = workflows[i];
 
         // Call actual API to install workflow
+        const authHdrs = await getAuthHeader();
         const response = await fetch('/api/agency-builder/install-workflows', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', ...authHdrs },
           body: JSON.stringify({
             solutionId: solution.id,
             workflows: [workflow],

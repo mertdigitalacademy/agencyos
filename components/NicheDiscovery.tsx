@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { useI18n } from '../services/i18n';
+import { getAuthHeader } from '../src/lib/supabase';
 import type { AgencyBuilderSector, AgencyBuilderNiche, LocalizedString, CurrencyCode } from '../types';
 
 // Helper to get localized string
@@ -90,9 +91,10 @@ export default function NicheDiscovery({ sector, onSelectNiche, onBack, onGenera
     setError(null);
 
     try {
+      const authHeaders = await getAuthHeader();
       const response = await fetch('/api/agency-builder/discover-niches', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHeaders },
         body: JSON.stringify({
           sectorId: sector.id,
           description: description.trim(),

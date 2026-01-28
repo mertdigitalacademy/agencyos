@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useI18n } from '../services/i18n';
+import { getAuthHeader } from '../src/lib/supabase';
 import {
   CouncilReviewButton,
   CouncilBadgeLarge,
@@ -144,9 +145,10 @@ export default function ProposalBuilder({
     setError(null);
 
     try {
+      const authHeaders = await getAuthHeader();
       const response = await fetch('/api/proposals/generate', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHeaders },
         body: JSON.stringify({
           clientName,
           clientCompany,
@@ -319,9 +321,10 @@ export default function ProposalBuilder({
       };
 
       // Try to send via API
+      const authHdrs = await getAuthHeader();
       const response = await fetch('/api/proposals', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHdrs },
         body: JSON.stringify(proposal),
       });
 

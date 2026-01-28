@@ -1,30 +1,21 @@
 import type { Project, ProjectBrief } from "../../types";
-import { readJsonFile, writeJsonFile, isUsingSupabase } from "./storage";
+import { isUsingSupabase } from "./storage";
 import * as supabase from "./supabaseStorage";
 
-const PROJECTS_FILE = "projects.json";
+function requireDb(): void {
+  if (!isUsingSupabase()) {
+    throw new Error("Database not available");
+  }
+}
 
 export async function listProjects(userId?: string): Promise<Project[]> {
-  if (isUsingSupabase()) {
-    try {
-      return await supabase.listProjects(userId);
-    } catch (e) {
-      console.error("Supabase listProjects failed, falling back to JSON:", e);
-    }
-  }
-  return readJsonFile<Project[]>(PROJECTS_FILE, []);
+  requireDb();
+  return await supabase.listProjects(userId);
 }
 
 export async function getProject(projectId: string, userId?: string): Promise<Project | null> {
-  if (isUsingSupabase()) {
-    try {
-      return await supabase.getProject(projectId, userId);
-    } catch (e) {
-      console.error("Supabase getProject failed, falling back to JSON:", e);
-    }
-  }
-  const projects = await listProjects();
-  return projects.find((p) => p.id === projectId) ?? null;
+  requireDb();
+  return await supabase.getProject(projectId, userId);
 }
 
 export function createProjectFromBrief(brief: ProjectBrief): Project {
@@ -70,55 +61,18 @@ export function createProjectFromBrief(brief: ProjectBrief): Project {
 }
 
 export async function createProject(brief: ProjectBrief, userId?: string): Promise<Project> {
-  if (isUsingSupabase()) {
-    try {
-      // Check if project exists first
-      const existing = await supabase.getProject(brief.id, userId);
-      if (existing) return existing;
-      return await supabase.createProject(brief, userId);
-    } catch (e) {
-      console.error("Supabase createProject failed, falling back to JSON:", e);
-    }
-  }
-
-  const projects = await listProjects();
-  const existing = projects.find((p) => p.id === brief.id);
+  requireDb();
+  const existing = await supabase.getProject(brief.id, userId);
   if (existing) return existing;
-
-  const project = createProjectFromBrief(brief);
-  await writeJsonFile(PROJECTS_FILE, [project, ...projects]);
-  return project;
+  return await supabase.createProject(brief, userId);
 }
 
 export async function saveProject(updated: Project, userId?: string): Promise<Project> {
-  if (isUsingSupabase()) {
-    try {
-      return await supabase.saveProject(updated, userId);
-    } catch (e) {
-      console.error("Supabase saveProject failed, falling back to JSON:", e);
-    }
-  }
-
-  const projects = await listProjects();
-  const next = projects.some((p) => p.id === updated.id)
-    ? projects.map((p) => (p.id === updated.id ? updated : p))
-    : [updated, ...projects];
-  await writeJsonFile(PROJECTS_FILE, next);
-  return updated;
+  requireDb();
+  return await supabase.saveProject(updated, userId);
 }
 
 export async function deleteProject(projectId: string, userId?: string): Promise<void> {
-  if (isUsingSupabase()) {
-    try {
-      await supabase.deleteProject(projectId, userId);
-      return;
-    } catch (e) {
-      console.error("Supabase deleteProject failed, falling back to JSON:", e);
-    }
-  }
-
-  const projects = await listProjects();
-  const next = projects.filter((p) => p.id !== projectId);
-  await writeJsonFile(PROJECTS_FILE, next);
+  requireDb();
+  await supabase.deleteProject(projectId, userId);
 }
-

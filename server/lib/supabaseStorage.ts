@@ -171,15 +171,17 @@ export async function listProjects(userId?: string): Promise<Project[]> {
   const results = await Promise.all(
     projects.map(async (p: Record<string, unknown>) => {
       const id = String(p.id);
-      const [wf, docs, logs, incidents, chat, crm] = await Promise.all([
+      const [wf, docs, logs, incidents, chat, crm, fin, gov] = await Promise.all([
         sb.from("project_workflows").select("*").eq("project_id", id).order("created_at", { ascending: false }),
         sb.from("project_documents").select("*").eq("project_id", id).order("created_at", { ascending: false }),
-        sb.from("execution_logs").select("*").eq("project_id", id).order("timestamp", { ascending: false }).limit(100),
+        sb.from("project_execution_logs").select("*").eq("project_id", id).order("timestamp", { ascending: false }).limit(100),
         sb.from("project_incidents").select("*").eq("project_id", id).order("timestamp", { ascending: false }),
-        sb.from("operator_chat").select("*").eq("project_id", id).order("created_at", { ascending: true }),
-        sb.from("crm_activities").select("*").eq("project_id", id).order("timestamp", { ascending: false }),
+        sb.from("project_operator_chat").select("*").eq("project_id", id).order("created_at", { ascending: true }),
+        sb.from("project_crm_activities").select("*").eq("project_id", id).order("timestamp", { ascending: false }),
+        sb.from("project_financials").select("*").eq("project_id", id).maybeSingle(),
+        sb.from("project_governance").select("*").eq("project_id", id).maybeSingle(),
       ]);
-      return assembleProject(p, wf.data ?? [], docs.data ?? [], logs.data ?? [], incidents.data ?? [], chat.data ?? [], crm.data ?? []);
+      return assembleProject(p, wf.data ?? [], docs.data ?? [], logs.data ?? [], incidents.data ?? [], chat.data ?? [], crm.data ?? [], fin.data, gov.data);
     })
   );
 
@@ -197,16 +199,18 @@ export async function getProject(projectId: string, userId?: string): Promise<Pr
   if (!data) return null;
 
   const id = String(data.id);
-  const [wf, docs, logs, incidents, chat, crm] = await Promise.all([
+  const [wf, docs, logs, incidents, chat, crm, fin, gov] = await Promise.all([
     sb.from("project_workflows").select("*").eq("project_id", id).order("created_at", { ascending: false }),
     sb.from("project_documents").select("*").eq("project_id", id).order("created_at", { ascending: false }),
-    sb.from("execution_logs").select("*").eq("project_id", id).order("timestamp", { ascending: false }).limit(100),
+    sb.from("project_execution_logs").select("*").eq("project_id", id).order("timestamp", { ascending: false }).limit(100),
     sb.from("project_incidents").select("*").eq("project_id", id).order("timestamp", { ascending: false }),
-    sb.from("operator_chat").select("*").eq("project_id", id).order("created_at", { ascending: true }),
-    sb.from("crm_activities").select("*").eq("project_id", id).order("timestamp", { ascending: false }),
+    sb.from("project_operator_chat").select("*").eq("project_id", id).order("created_at", { ascending: true }),
+    sb.from("project_crm_activities").select("*").eq("project_id", id).order("timestamp", { ascending: false }),
+    sb.from("project_financials").select("*").eq("project_id", id).maybeSingle(),
+    sb.from("project_governance").select("*").eq("project_id", id).maybeSingle(),
   ]);
 
-  return assembleProject(data, wf.data ?? [], docs.data ?? [], logs.data ?? [], incidents.data ?? [], chat.data ?? [], crm.data ?? []);
+  return assembleProject(data, wf.data ?? [], docs.data ?? [], logs.data ?? [], incidents.data ?? [], chat.data ?? [], crm.data ?? [], fin.data, gov.data);
 }
 
 export async function createProject(brief: ProjectBrief, userId?: string): Promise<Project> {
@@ -238,7 +242,7 @@ export async function createProject(brief: ProjectBrief, userId?: string): Promi
   throwIfError(briefErr, "createProject:brief");
 
   // Insert initial CRM activity
-  const { error: crmErr } = await sb.from("crm_activities").insert({
+  const { error: crmErr } = await sb.from("project_crm_activities").insert({
     id: generateId("crm"),
     project_id: brief.id,
     type: "Note",
@@ -249,7 +253,7 @@ export async function createProject(brief: ProjectBrief, userId?: string): Promi
   throwIfError(crmErr, "createProject:crm");
 
   // Insert initial operator message
-  const { error: chatErr } = await sb.from("operator_chat").insert({
+  const { error: chatErr } = await sb.from("project_operator_chat").insert({
     id: generateId("msg"),
     project_id: brief.id,
     role: "system",
@@ -267,7 +271,7 @@ export async function saveProject(project: Project, userId?: string): Promise<Pr
   const sb = requireClient();
   const now = nowIso();
 
-  // Update main project (financials/governance are not DB columns)
+  // Update main project
   let updateQuery = sb.from("projects").update({
     status: project.status,
     total_billed: project.totalBilled,
@@ -279,7 +283,8 @@ export async function saveProject(project: Project, userId?: string): Promise<Pr
   throwIfError(projErr, "saveProject:project");
 
   // Update brief
-  const { error: briefErr } = await sb.from("project_briefs").update({
+  const { error: briefErr } = await sb.from("project_briefs").upsert({
+    project_id: project.id,
     client_name: project.brief.clientName,
     description: project.brief.description,
     industry: project.brief.industry,
@@ -287,8 +292,26 @@ export async function saveProject(project: Project, userId?: string): Promise<Pr
     tools: project.brief.tools,
     budget: project.brief.budget,
     risk_level: project.brief.riskLevel,
-  }).eq("project_id", project.id);
+  }, { onConflict: "project_id" });
   throwIfError(briefErr, "saveProject:brief");
+
+  // Upsert financials and governance (separate tables)
+  const { error: finErr } = await sb.from("project_financials").upsert({
+    project_id: project.id,
+    revenue: project.financials.revenue,
+    expenses: project.financials.expenses,
+    hours_saved: project.financials.hoursSaved,
+    cost_per_execution: project.financials.costPerExecution,
+  }, { onConflict: "project_id" });
+  throwIfError(finErr, "saveProject:financials");
+
+  const { error: govErr } = await sb.from("project_governance").upsert({
+    project_id: project.id,
+    certified: project.governance.certified,
+    last_score: project.governance.lastScore,
+    verdict: project.governance.verdict,
+  }, { onConflict: "project_id" });
+  throwIfError(govErr, "saveProject:governance");
 
   // Sync sub-tables: delete + re-insert
   const subTables = [
@@ -302,7 +325,7 @@ export async function saveProject(project: Project, userId?: string): Promise<Pr
       content: doc.content, url: doc.url, amount: doc.amount, external_ref: doc.externalRef ?? null,
       created_at: doc.createdAt,
     }))},
-    { table: "execution_logs", data: project.executionLogs.slice(-100).map((log) => ({
+    { table: "project_execution_logs", data: project.executionLogs.slice(-100).map((log) => ({
       id: log.id, project_id: project.id, workflow_name: log.workflowName, status: log.status,
       error_details: log.errorDetails, timestamp: log.timestamp, duration: log.duration,
     }))},
@@ -310,11 +333,11 @@ export async function saveProject(project: Project, userId?: string): Promise<Pr
       id: inc.id, project_id: project.id, title: inc.title, severity: inc.severity,
       status: inc.status, root_cause: inc.rootCause, resolution_plan: inc.resolutionPlan, timestamp: inc.timestamp,
     }))},
-    { table: "operator_chat", data: project.operatorChat.map((msg) => ({
+    { table: "project_operator_chat", data: project.operatorChat.map((msg) => ({
       id: msg.id, project_id: project.id, role: msg.role, content: msg.content,
       tool_call: msg.toolCall ?? null, created_at: now,
     }))},
-    { table: "crm_activities", data: project.crmActivities.map((act) => ({
+    { table: "project_crm_activities", data: project.crmActivities.map((act) => ({
       id: act.id, project_id: project.id, type: act.type, subject: act.subject,
       status: act.status, timestamp: act.timestamp,
     }))},
@@ -350,6 +373,8 @@ function assembleProject(
   incidents: Record<string, unknown>[],
   operatorChat: Record<string, unknown>[],
   crmActivities: Record<string, unknown>[],
+  financialsRow?: Record<string, unknown> | null,
+  governanceRow?: Record<string, unknown> | null,
 ): Project {
   // project_briefs comes as an array or object from Supabase join
   const briefData = Array.isArray(row.project_briefs)
@@ -425,13 +450,22 @@ function assembleProject(
     timestamp: String(a.timestamp ?? nowIso()),
   }));
 
-  const financials = (row.financials as Project["financials"]) ?? {
-    revenue: 0, expenses: 0, hoursSaved: 0, costPerExecution: 0,
-  };
+  const financials: Project["financials"] = financialsRow
+    ? {
+        revenue: Number(financialsRow.revenue ?? 0),
+        expenses: Number(financialsRow.expenses ?? 0),
+        hoursSaved: Number(financialsRow.hours_saved ?? 0),
+        costPerExecution: Number(financialsRow.cost_per_execution ?? 0),
+      }
+    : { revenue: 0, expenses: 0, hoursSaved: 0, costPerExecution: 0 };
 
-  const governance = (row.governance as Project["governance"]) ?? {
-    certified: false, lastScore: 0, verdict: "None",
-  };
+  const governance: Project["governance"] = governanceRow
+    ? {
+        certified: Boolean(governanceRow.certified),
+        lastScore: Number(governanceRow.last_score ?? 0),
+        verdict: String(governanceRow.verdict ?? "None"),
+      }
+    : { certified: false, lastScore: 0, verdict: "None" };
 
   return {
     id: String(row.id),
@@ -938,11 +972,11 @@ export async function getMarketRadarState(userId?: string): Promise<MarketRadarS
   const stateId = String(stateRow.id);
 
   const [opportunities, youtubeTrends, youtubeIdeas, internetTrends, leads] = await Promise.all([
-    sb.from("market_opportunities").select("*").eq("state_id", stateId),
-    sb.from("market_youtube_trends").select("*").eq("state_id", stateId),
-    sb.from("market_youtube_ideas").select("*").eq("state_id", stateId),
-    sb.from("market_internet_trends").select("*").eq("state_id", stateId),
-    sb.from("market_lead_candidates").select("*").eq("state_id", stateId),
+    sb.from("market_opportunities").select("*").eq("market_radar_id", stateId),
+    sb.from("market_youtube_trends").select("*").eq("market_radar_id", stateId),
+    sb.from("market_youtube_ideas").select("*").eq("market_radar_id", stateId),
+    sb.from("market_internet_trends").select("*").eq("market_radar_id", stateId),
+    sb.from("market_leads").select("*").eq("market_radar_id", stateId),
   ]);
 
   return {
@@ -975,15 +1009,15 @@ export async function saveMarketRadarState(state: MarketRadarState, userId?: str
 
   // Clear and re-insert sub-tables
   const subTables = [
-    { table: "market_opportunities", data: state.opportunities.map((opp) => ({ id: opp.id, state_id: id, data: opp })) },
-    { table: "market_youtube_trends", data: state.youtubeTrends.map((t) => ({ id: t.id, state_id: id, data: t })) },
-    { table: "market_youtube_ideas", data: state.youtubeIdeas.map((i) => ({ id: i.id, state_id: id, data: i })) },
-    { table: "market_internet_trends", data: state.internetTrends.map((t) => ({ id: t.id, state_id: id, data: t })) },
-    { table: "market_lead_candidates", data: state.leads.map((l) => ({ id: l.id, state_id: id, data: l })) },
+    { table: "market_opportunities", data: state.opportunities.map((opp) => ({ id: opp.id, market_radar_id: id, data: opp })) },
+    { table: "market_youtube_trends", data: state.youtubeTrends.map((t) => ({ id: t.id, market_radar_id: id, data: t })) },
+    { table: "market_youtube_ideas", data: state.youtubeIdeas.map((i) => ({ id: i.id, market_radar_id: id, data: i })) },
+    { table: "market_internet_trends", data: state.internetTrends.map((t) => ({ id: t.id, market_radar_id: id, data: t })) },
+    { table: "market_leads", data: state.leads.map((l) => ({ id: l.id, market_radar_id: id, data: l })) },
   ];
 
   for (const { table, data } of subTables) {
-    const { error: delErr } = await sb.from(table).delete().eq("state_id", id);
+    const { error: delErr } = await sb.from(table).delete().eq("market_radar_id", id);
     throwIfError(delErr, `saveMarketRadarState:delete:${table}`);
     if (data.length > 0) {
       const { error: insErr } = await sb.from(table).insert(data);

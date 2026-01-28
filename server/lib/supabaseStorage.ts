@@ -690,14 +690,13 @@ export async function getAssistantState(userId?: string): Promise<AssistantState
   throwIfError(stateErr, "getAssistantState:state");
   if (!stateRow) return null;
 
-  let msgsQuery = sb.from("assistant_messages").select("*").order("created_at", { ascending: true }).limit(300);
-  if (userId) {
-    msgsQuery = msgsQuery.eq("user_id", userId);
-  } else {
-    msgsQuery = msgsQuery.is("user_id", null);
-  }
-
-  const { data: msgs, error: msgsErr } = await msgsQuery;
+  const stateId = String(stateRow.id);
+  const { data: msgs, error: msgsErr } = await sb
+    .from("assistant_messages")
+    .select("*")
+    .eq("assistant_state_id", stateId)
+    .order("created_at", { ascending: true })
+    .limit(300);
   throwIfError(msgsErr, "getAssistantState:messages");
 
   const messages: AssistantMessage[] = (msgs ?? []).map((m: Record<string, unknown>) => ({
@@ -728,20 +727,15 @@ export async function saveAssistantState(state: AssistantState, userId?: string)
   }, { onConflict: "id" });
   throwIfError(stateErr, "saveAssistantState:state");
 
-  // Delete old messages
-  if (userId) {
-    const { error: delErr } = await sb.from("assistant_messages").delete().eq("user_id", userId);
-    throwIfError(delErr, "saveAssistantState:deleteMessages");
-  } else {
-    const { error: delErr } = await sb.from("assistant_messages").delete().is("user_id", null);
-    throwIfError(delErr, "saveAssistantState:deleteMessages");
-  }
+  // Delete old messages (linked by assistant_state_id, not user_id)
+  const { error: delErr } = await sb.from("assistant_messages").delete().eq("assistant_state_id", state.id);
+  throwIfError(delErr, "saveAssistantState:deleteMessages");
 
   // Insert new messages
   if (state.messages.length > 0) {
     const rows = state.messages.map((msg) => ({
       id: msg.id,
-      user_id: userId ?? null,
+      assistant_state_id: state.id,
       role: msg.role,
       content: msg.content,
       tool_call: msg.toolCall ?? null,
@@ -860,14 +854,12 @@ export async function getAgencyState(userId?: string): Promise<AgencyState | nul
   throwIfError(stateErr, "getAgencyState:state");
   if (!stateRow) return null;
 
-  let docsQuery = sb.from("agency_documents").select("*").order("created_at", { ascending: false });
-  if (userId) {
-    docsQuery = docsQuery.eq("user_id", userId);
-  } else {
-    docsQuery = docsQuery.is("user_id", null);
-  }
-
-  const { data: docs, error: docsErr } = await docsQuery;
+  const stateId = String(stateRow.id);
+  const { data: docs, error: docsErr } = await sb
+    .from("agency_documents")
+    .select("*")
+    .eq("agency_state_id", stateId)
+    .order("created_at", { ascending: false });
   throwIfError(docsErr, "getAgencyState:documents");
 
   const documents: AgencyDocument[] = (docs ?? []).map((d: Record<string, unknown>) => ({
@@ -905,20 +897,15 @@ export async function saveAgencyState(state: AgencyState, userId?: string): Prom
   }, { onConflict: "id" });
   throwIfError(stateErr, "saveAgencyState:state");
 
-  // Delete old documents
-  if (userId) {
-    const { error: delErr } = await sb.from("agency_documents").delete().eq("user_id", userId);
-    throwIfError(delErr, "saveAgencyState:deleteDocs");
-  } else {
-    const { error: delErr } = await sb.from("agency_documents").delete().is("user_id", null);
-    throwIfError(delErr, "saveAgencyState:deleteDocs");
-  }
+  // Delete old documents (linked by agency_state_id, not user_id)
+  const { error: delErr } = await sb.from("agency_documents").delete().eq("agency_state_id", id);
+  throwIfError(delErr, "saveAgencyState:deleteDocs");
 
   // Insert new documents
   if (state.documents.length > 0) {
     const rows = state.documents.map((doc) => ({
       id: doc.id,
-      user_id: userId ?? null,
+      agency_state_id: id,
       type: doc.type,
       name: doc.name,
       status: doc.status,

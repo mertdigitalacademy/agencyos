@@ -59,7 +59,7 @@ import {
 } from "../../server/lib/ai";
 import { getCatalogIndex, searchCatalog, readWorkflowJsonById, resetCatalogIndexCache } from "../../server/lib/catalog";
 import { rewriteCatalogQueryFallback } from "../../server/lib/queryRewrite";
-import type { JourneyGoal, AgencyDocumentType, AssistantState, AssistantMessage } from "../../types";
+import type { JourneyGoal, AgencyDocumentType, AssistantState, AssistantMessage, ProjectBrief } from "../../types";
 import type { RuntimeSettings, EnvironmentName } from "../../server/lib/runtimeStore";
 
 // ============================================
@@ -634,8 +634,8 @@ route("GET", "/api/projects", async (_e, _c, _p, userId) => {
 
 route("POST", "/api/projects", async (event, _c, _p, userId) => {
   const deny = requireAuth(userId); if (deny) return deny;
-  const body = parseBody<Record<string, unknown>>(event);
-  const project = await projects.createProject(body as any, userId!);
+  const body = parseBody<{ brief: ProjectBrief }>(event);
+  const project = await projects.createProject(body.brief, userId!);
   return json(project);
 });
 

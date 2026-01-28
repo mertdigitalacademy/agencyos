@@ -111,12 +111,32 @@ export async function createUser(email: string, name?: string): Promise<{ id: st
 
   const { data, error } = await sb
     .from("users")
-    .upsert({ email, name, updated_at: nowIso() }, { onConflict: "email" })
-    .select("id, email, name")
+    .upsert({ email, display_name: name ?? null, updated_at: nowIso() }, { onConflict: "email" })
+    .select("id, email, display_name")
     .single();
 
   throwIfError(error, "createUser");
-  return data!;
+  return { id: data!.id, email: data!.email, name: data!.display_name ?? undefined };
+}
+
+/**
+ * Ensure a user record exists for the given Supabase Auth user.
+ * This is called on every authenticated request to handle the FK constraint.
+ */
+export async function ensureUserExists(authUserId: string, email: string): Promise<void> {
+  const sb = requireClient();
+
+  // Upsert: if user already exists by this id, do nothing
+  const { error } = await sb.from("users").upsert({
+    id: authUserId,
+    email,
+    updated_at: nowIso(),
+  }, { onConflict: "id" });
+
+  // Ignore errors silently — user might already exist
+  if (error) {
+    console.warn("ensureUserExists warning:", error.message);
+  }
 }
 
 export async function getUserByEmail(email: string): Promise<{ id: string; email: string; name?: string } | null> {
@@ -124,12 +144,12 @@ export async function getUserByEmail(email: string): Promise<{ id: string; email
 
   const { data, error } = await sb
     .from("users")
-    .select("id, email, name")
+    .select("id, email, display_name")
     .eq("email", email)
     .maybeSingle();
 
   throwIfError(error, "getUserByEmail");
-  return data;
+  return data ? { id: data.id, email: data.email, name: data.display_name ?? undefined } : null;
 }
 
 // ============================================
@@ -193,13 +213,11 @@ export async function createProject(brief: ProjectBrief, userId?: string): Promi
   const sb = requireClient();
   const now = nowIso();
 
-  // Insert project
+  // Insert project (financials/governance are computed defaults, not DB columns)
   const { error: projErr } = await sb.from("projects").upsert({
     id: brief.id,
     user_id: userId ?? null,
     status: "Intake",
-    financials: { revenue: 0, expenses: 0, hoursSaved: 0, costPerExecution: 0 },
-    governance: { certified: false, lastScore: 0, verdict: "None" },
     total_billed: 0,
     created_at: now,
     updated_at: now,
@@ -249,11 +267,9 @@ export async function saveProject(project: Project, userId?: string): Promise<Pr
   const sb = requireClient();
   const now = nowIso();
 
-  // Update main project
+  // Update main project (financials/governance are not DB columns)
   let updateQuery = sb.from("projects").update({
     status: project.status,
-    financials: project.financials,
-    governance: project.governance,
     total_billed: project.totalBilled,
     updated_at: now,
   }).eq("id", project.id);

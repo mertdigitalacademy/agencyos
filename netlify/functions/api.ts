@@ -35,6 +35,7 @@ import {
   deleteSecret as dbDeleteSecret,
   createCouncilJob as dbCreateCouncilJob,
   getCouncilJob as dbGetCouncilJob,
+  ensureUserExists,
 } from "../../server/lib/supabaseStorage";
 import * as projects from "../../server/lib/projects";
 import { generateAssistantReply } from "../../server/lib/assistant";
@@ -147,6 +148,12 @@ async function extractUserId(event: HandlerEvent): Promise<string | null> {
     const sb = createClient(url, key);
     const { data: { user }, error: authError } = await sb.auth.getUser(token);
     if (authError || !user) return null;
+
+    // Ensure user record exists in the users table (for FK constraints)
+    if (user.email) {
+      await ensureUserExists(user.id, user.email).catch(() => {});
+    }
+
     return user.id;
   } catch {
     return null;

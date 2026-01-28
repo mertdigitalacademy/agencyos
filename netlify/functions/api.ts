@@ -18,7 +18,7 @@ dotenv.config();
 // Import storage and handlers
 import {
   isSupabaseEnabled,
-  getSupabasePool,
+  getSupabaseClient,
   // Per-user storage functions (all accept userId)
   listOutboundLeads as dbListOutboundLeads,
   saveOutboundLead as dbSaveOutboundLead,
@@ -171,15 +171,21 @@ function requireAuth(userId: string | null): HandlerResponse | null {
 async function loadUserSecrets(userId: string | null): Promise<void> {
   if (!userId) return;
 
-  const pool = getSupabasePool();
-  if (!pool) return;
+  const sb = getSupabaseClient();
+  if (!sb) return;
 
   try {
-    const result = await pool.query(
-      "SELECT key, value FROM secrets WHERE user_id = $1 AND environment = 'Production'",
-      [userId]
-    );
-    for (const row of result.rows) {
+    const { data, error } = await sb
+      .from("secrets")
+      .select("key, value")
+      .eq("user_id", userId)
+      .eq("environment", "Production");
+
+    if (error) {
+      console.warn("Failed to load user secrets:", error.message);
+      return;
+    }
+    for (const row of (data ?? [])) {
       process.env[row.key] = row.value;
     }
   } catch (e) {
@@ -723,22 +729,33 @@ route("GET", "/api/council/sessions", async (event, _c, _p, userId) => {
   const deny = requireAuth(userId); if (deny) return deny;
   const projectId = event.queryStringParameters?.projectId;
 
-  const pool = getSupabasePool();
-  if (!pool) return json([]);
+  const sb = getSupabaseClient();
+  if (!sb) return json([]);
 
-  // Filter by user's projects only via JOIN
-  let query = `SELECT cs.* FROM council_sessions cs
-    JOIN projects p ON cs.project_id = p.id
-    WHERE p.user_id = $1`;
-  const qParams: string[] = [userId!];
+  // Get user's project IDs first, then filter council sessions
+  const { data: userProjects } = await sb
+    .from("projects")
+    .select("id")
+    .eq("user_id", userId!);
+
+  if (!userProjects || userProjects.length === 0) return json([]);
+
+  const projectIds = userProjects.map((p: { id: string }) => p.id);
+
+  let csQuery = sb
+    .from("council_sessions")
+    .select("*")
+    .in("project_id", projectIds)
+    .order("created_at", { ascending: false })
+    .limit(50);
+
   if (projectId) {
-    query += " AND cs.project_id = $2";
-    qParams.push(projectId);
+    csQuery = csQuery.eq("project_id", projectId);
   }
-  query += " ORDER BY cs.created_at DESC LIMIT 50";
 
-  const result = await pool.query(query, qParams);
-  return json(result.rows);
+  const { data, error } = await csQuery;
+  if (error) return json([]);
+  return json(data ?? []);
 });
 
 // --- Demo ---

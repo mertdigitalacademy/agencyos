@@ -1,15 +1,16 @@
 /**
  * Supabase Storage Layer for AgencyOS
  *
- * This module provides PostgreSQL-based storage operations using Supabase.
- * It replaces the JSON file-based storage for production deployments.
+ * This module provides storage operations using the Supabase JS Client (PostgREST).
+ * It replaces the previous pg Pool implementation to work from environments
+ * without direct PostgreSQL access (e.g., Netlify Functions with IPv6-only DB).
  *
  * Usage:
- * - Set AGENCYOS_DATABASE_URL environment variable to enable
- * - Falls back to JSON storage if database is unavailable
+ * - Set SUPABASE_URL and SUPABASE_SERVICE_KEY environment variables to enable
+ * - The service role key bypasses Row Level Security for server-side operations
  */
 
-import pg from "pg";
+import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import type {
   Project,
   ProjectBrief,
@@ -38,42 +39,47 @@ import type {
 } from "../../types";
 import type { RuntimeSettings, StoredSecret, EnvironmentName } from "./runtimeStore";
 
-type PgPool = pg.Pool;
-
 // ============================================
 // CONNECTION MANAGEMENT
 // ============================================
 
-let pool: PgPool | null = null;
-
-function getDatabaseUrl(): string {
-  return String(process.env.AGENCYOS_DATABASE_URL ?? "").trim();
-}
+let client: SupabaseClient | null = null;
 
 export function isSupabaseEnabled(): boolean {
-  return getDatabaseUrl().length > 0;
+  return Boolean(
+    (process.env.SUPABASE_URL ?? "").trim() &&
+    (process.env.SUPABASE_SERVICE_KEY ?? "").trim()
+  );
 }
 
-export function getSupabasePool(): PgPool | null {
-  const url = getDatabaseUrl();
-  if (!url) return null;
-  if (pool) return pool;
-  const { Pool } = pg;
-  pool = new Pool({
-    connectionString: url,
-    ssl: url.includes("supabase.co") ? { rejectUnauthorized: false } : undefined,
-  });
-  return pool;
+export function getSupabaseClient(): SupabaseClient | null {
+  if (!isSupabaseEnabled()) return null;
+  if (client) return client;
+  client = createClient(
+    process.env.SUPABASE_URL!.trim(),
+    process.env.SUPABASE_SERVICE_KEY!.trim()
+  );
+  return client;
+}
+
+/** @deprecated Use getSupabaseClient() instead. Kept for backward compat during migration. */
+export const getSupabasePool = getSupabaseClient;
+
+function requireClient(): SupabaseClient {
+  const sb = getSupabaseClient();
+  if (!sb) throw new Error("Supabase not configured (missing SUPABASE_URL or SUPABASE_SERVICE_KEY)");
+  return sb;
 }
 
 export async function supabaseHealthcheck(): Promise<{ connected: boolean; reason?: string }> {
-  const p = getSupabasePool();
-  if (!p) return { connected: false, reason: "Missing AGENCYOS_DATABASE_URL" };
+  const sb = getSupabaseClient();
+  if (!sb) return { connected: false, reason: "Missing SUPABASE_URL or SUPABASE_SERVICE_KEY" };
   try {
-    await p.query("SELECT 1 as ok");
+    const { error } = await sb.from("projects").select("id").limit(1);
+    if (error) return { connected: false, reason: error.message };
     return { connected: true };
   } catch (e) {
-    return { connected: false, reason: e instanceof Error ? e.message : "Database connection failed" };
+    return { connected: false, reason: e instanceof Error ? e.message : "Connection failed" };
   }
 }
 
@@ -89,29 +95,41 @@ function generateId(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+/** Throw if Supabase returns an error */
+function throwIfError(error: { message: string; code?: string } | null, context?: string): void {
+  if (error) {
+    throw new Error(`${context ? context + ": " : ""}${error.message}`);
+  }
+}
+
 // ============================================
 // USERS (for multi-tenant support)
 // ============================================
 
 export async function createUser(email: string, name?: string): Promise<{ id: string; email: string; name?: string }> {
-  const p = getSupabasePool();
-  if (!p) throw new Error("Database not connected");
+  const sb = requireClient();
 
-  const result = await p.query(
-    `INSERT INTO users (email, name) VALUES ($1, $2)
-     ON CONFLICT (email) DO UPDATE SET name = COALESCE(EXCLUDED.name, users.name), updated_at = NOW()
-     RETURNING id, email, name`,
-    [email, name]
-  );
-  return result.rows[0];
+  const { data, error } = await sb
+    .from("users")
+    .upsert({ email, name, updated_at: nowIso() }, { onConflict: "email" })
+    .select("id, email, name")
+    .single();
+
+  throwIfError(error, "createUser");
+  return data!;
 }
 
 export async function getUserByEmail(email: string): Promise<{ id: string; email: string; name?: string } | null> {
-  const p = getSupabasePool();
-  if (!p) throw new Error("Database not connected");
+  const sb = requireClient();
 
-  const result = await p.query("SELECT id, email, name FROM users WHERE email = $1", [email]);
-  return result.rows[0] ?? null;
+  const { data, error } = await sb
+    .from("users")
+    .select("id, email, name")
+    .eq("email", email)
+    .maybeSingle();
+
+  throwIfError(error, "getUserByEmail");
+  return data;
 }
 
 // ============================================
@@ -119,445 +137,296 @@ export async function getUserByEmail(email: string): Promise<{ id: string; email
 // ============================================
 
 export async function listProjects(userId?: string): Promise<Project[]> {
-  const p = getSupabasePool();
-  if (!p) throw new Error("Database not connected");
+  const sb = requireClient();
 
-  let query = `
-    SELECT p.*,
-           pb.client_name, pb.description, pb.industry, pb.goals, pb.tools, pb.budget, pb.risk_level,
-           COALESCE(
-             (SELECT json_agg(pw.* ORDER BY pw.created_at DESC)
-              FROM project_workflows pw WHERE pw.project_id = p.id),
-             '[]'
-           ) as workflows,
-           COALESCE(
-             (SELECT json_agg(pd.* ORDER BY pd.created_at DESC)
-              FROM project_documents pd WHERE pd.project_id = p.id),
-             '[]'
-           ) as documents,
-           COALESCE(
-             (SELECT json_agg(el.* ORDER BY el.timestamp DESC LIMIT 100)
-              FROM execution_logs el WHERE el.project_id = p.id),
-             '[]'
-           ) as execution_logs,
-           COALESCE(
-             (SELECT json_agg(pi.* ORDER BY pi.timestamp DESC)
-              FROM project_incidents pi WHERE pi.project_id = p.id),
-             '[]'
-           ) as incidents,
-           COALESCE(
-             (SELECT json_agg(oc.* ORDER BY oc.created_at ASC)
-              FROM operator_chat oc WHERE oc.project_id = p.id),
-             '[]'
-           ) as operator_chat,
-           COALESCE(
-             (SELECT json_agg(ca.* ORDER BY ca.timestamp DESC)
-              FROM crm_activities ca WHERE ca.project_id = p.id),
-             '[]'
-           ) as crm_activities
-    FROM projects p
-    LEFT JOIN project_briefs pb ON pb.project_id = p.id
-  `;
+  // Fetch projects with briefs
+  let query = sb.from("projects").select("*, project_briefs(*)").order("created_at", { ascending: false });
+  if (userId) query = query.eq("user_id", userId);
 
-  const params: unknown[] = [];
-  if (userId) {
-    query += " WHERE p.user_id = $1";
-    params.push(userId);
-  }
-  query += " ORDER BY p.created_at DESC";
+  const { data: projects, error } = await query;
+  throwIfError(error, "listProjects");
+  if (!projects || projects.length === 0) return [];
 
-  const result = await p.query(query, params);
-  return result.rows.map(rowToProject);
+  // For each project, fetch related data in parallel
+  const results = await Promise.all(
+    projects.map(async (p: Record<string, unknown>) => {
+      const id = String(p.id);
+      const [wf, docs, logs, incidents, chat, crm] = await Promise.all([
+        sb.from("project_workflows").select("*").eq("project_id", id).order("created_at", { ascending: false }),
+        sb.from("project_documents").select("*").eq("project_id", id).order("created_at", { ascending: false }),
+        sb.from("execution_logs").select("*").eq("project_id", id).order("timestamp", { ascending: false }).limit(100),
+        sb.from("project_incidents").select("*").eq("project_id", id).order("timestamp", { ascending: false }),
+        sb.from("operator_chat").select("*").eq("project_id", id).order("created_at", { ascending: true }),
+        sb.from("crm_activities").select("*").eq("project_id", id).order("timestamp", { ascending: false }),
+      ]);
+      return assembleProject(p, wf.data ?? [], docs.data ?? [], logs.data ?? [], incidents.data ?? [], chat.data ?? [], crm.data ?? []);
+    })
+  );
+
+  return results;
 }
 
 export async function getProject(projectId: string, userId?: string): Promise<Project | null> {
-  const p = getSupabasePool();
-  if (!p) throw new Error("Database not connected");
+  const sb = requireClient();
 
-  let query = `
-    SELECT p.*,
-           pb.client_name, pb.description, pb.industry, pb.goals, pb.tools, pb.budget, pb.risk_level,
-           COALESCE(
-             (SELECT json_agg(pw.* ORDER BY pw.created_at DESC)
-              FROM project_workflows pw WHERE pw.project_id = p.id),
-             '[]'
-           ) as workflows,
-           COALESCE(
-             (SELECT json_agg(pd.* ORDER BY pd.created_at DESC)
-              FROM project_documents pd WHERE pd.project_id = p.id),
-             '[]'
-           ) as documents,
-           COALESCE(
-             (SELECT json_agg(el.* ORDER BY el.timestamp DESC LIMIT 100)
-              FROM execution_logs el WHERE el.project_id = p.id),
-             '[]'
-           ) as execution_logs,
-           COALESCE(
-             (SELECT json_agg(pi.* ORDER BY pi.timestamp DESC)
-              FROM project_incidents pi WHERE pi.project_id = p.id),
-             '[]'
-           ) as incidents,
-           COALESCE(
-             (SELECT json_agg(oc.* ORDER BY oc.created_at ASC)
-              FROM operator_chat oc WHERE oc.project_id = p.id),
-             '[]'
-           ) as operator_chat,
-           COALESCE(
-             (SELECT json_agg(ca.* ORDER BY ca.timestamp DESC)
-              FROM crm_activities ca WHERE ca.project_id = p.id),
-             '[]'
-           ) as crm_activities
-    FROM projects p
-    LEFT JOIN project_briefs pb ON pb.project_id = p.id
-    WHERE p.id = $1
-  `;
+  let query = sb.from("projects").select("*, project_briefs(*)").eq("id", projectId);
+  if (userId) query = query.eq("user_id", userId);
 
-  const params: unknown[] = [projectId];
-  if (userId) {
-    query += " AND p.user_id = $2";
-    params.push(userId);
-  }
+  const { data, error } = await query.maybeSingle();
+  throwIfError(error, "getProject");
+  if (!data) return null;
 
-  const result = await p.query(query, params);
-  if (result.rows.length === 0) return null;
-  return rowToProject(result.rows[0]);
+  const id = String(data.id);
+  const [wf, docs, logs, incidents, chat, crm] = await Promise.all([
+    sb.from("project_workflows").select("*").eq("project_id", id).order("created_at", { ascending: false }),
+    sb.from("project_documents").select("*").eq("project_id", id).order("created_at", { ascending: false }),
+    sb.from("execution_logs").select("*").eq("project_id", id).order("timestamp", { ascending: false }).limit(100),
+    sb.from("project_incidents").select("*").eq("project_id", id).order("timestamp", { ascending: false }),
+    sb.from("operator_chat").select("*").eq("project_id", id).order("created_at", { ascending: true }),
+    sb.from("crm_activities").select("*").eq("project_id", id).order("timestamp", { ascending: false }),
+  ]);
+
+  return assembleProject(data, wf.data ?? [], docs.data ?? [], logs.data ?? [], incidents.data ?? [], chat.data ?? [], crm.data ?? []);
 }
 
 export async function createProject(brief: ProjectBrief, userId?: string): Promise<Project> {
-  const p = getSupabasePool();
-  if (!p) throw new Error("Database not connected");
-
+  const sb = requireClient();
   const now = nowIso();
-  const client = await p.connect();
 
-  try {
-    await client.query("BEGIN");
+  // Insert project
+  const { error: projErr } = await sb.from("projects").upsert({
+    id: brief.id,
+    user_id: userId ?? null,
+    status: "Intake",
+    financials: { revenue: 0, expenses: 0, hoursSaved: 0, costPerExecution: 0 },
+    governance: { certified: false, lastScore: 0, verdict: "None" },
+    total_billed: 0,
+    created_at: now,
+    updated_at: now,
+  }, { onConflict: "id", ignoreDuplicates: true });
+  throwIfError(projErr, "createProject:project");
 
-    // Insert project
-    await client.query(
-      `INSERT INTO projects (id, user_id, status, financials, governance, total_billed, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
-       ON CONFLICT (id) DO NOTHING`,
-      [
-        brief.id,
-        userId,
-        "Intake",
-        JSON.stringify({ revenue: 0, expenses: 0, hoursSaved: 0, costPerExecution: 0 }),
-        JSON.stringify({ certified: false, lastScore: 0, verdict: "None" }),
-        0,
-        now,
-      ]
-    );
+  // Insert brief
+  const { error: briefErr } = await sb.from("project_briefs").upsert({
+    project_id: brief.id,
+    client_name: brief.clientName,
+    description: brief.description,
+    industry: brief.industry,
+    goals: brief.goals,
+    tools: brief.tools,
+    budget: brief.budget,
+    risk_level: brief.riskLevel,
+  }, { onConflict: "project_id" });
+  throwIfError(briefErr, "createProject:brief");
 
-    // Insert brief
-    await client.query(
-      `INSERT INTO project_briefs (project_id, client_name, description, industry, goals, tools, budget, risk_level)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-       ON CONFLICT (project_id) DO UPDATE SET
-         client_name = EXCLUDED.client_name,
-         description = EXCLUDED.description,
-         industry = EXCLUDED.industry,
-         goals = EXCLUDED.goals,
-         tools = EXCLUDED.tools,
-         budget = EXCLUDED.budget,
-         risk_level = EXCLUDED.risk_level`,
-      [
-        brief.id,
-        brief.clientName,
-        brief.description,
-        brief.industry,
-        brief.goals,
-        brief.tools,
-        brief.budget,
-        brief.riskLevel,
-      ]
-    );
+  // Insert initial CRM activity
+  const { error: crmErr } = await sb.from("crm_activities").insert({
+    id: generateId("crm"),
+    project_id: brief.id,
+    type: "Note",
+    subject: "Project Initialized from Intake Wizard",
+    status: "Completed",
+    timestamp: now,
+  });
+  throwIfError(crmErr, "createProject:crm");
 
-    // Insert initial CRM activity
-    await client.query(
-      `INSERT INTO crm_activities (id, project_id, type, subject, status, timestamp)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
-      [generateId("crm"), brief.id, "Note", "Project Initialized from Intake Wizard", "Completed", now]
-    );
+  // Insert initial operator message
+  const { error: chatErr } = await sb.from("operator_chat").insert({
+    id: generateId("msg"),
+    project_id: brief.id,
+    role: "system",
+    content: `Operator initialized for ${brief.clientName}. I am connected to your n8n MCP server cluster.`,
+    created_at: now,
+  });
+  throwIfError(chatErr, "createProject:chat");
 
-    // Insert initial operator message
-    await client.query(
-      `INSERT INTO operator_chat (id, project_id, role, content, created_at)
-       VALUES ($1, $2, $3, $4, $5)`,
-      [
-        generateId("msg"),
-        brief.id,
-        "system",
-        `Operator initialized for ${brief.clientName}. I am connected to your n8n MCP server cluster.`,
-        now,
-      ]
-    );
-
-    await client.query("COMMIT");
-
-    // Return the created project
-    const project = await getProject(brief.id, userId);
-    if (!project) throw new Error("Failed to retrieve created project");
-    return project;
-  } catch (e) {
-    await client.query("ROLLBACK");
-    throw e;
-  } finally {
-    client.release();
-  }
+  const project = await getProject(brief.id, userId);
+  if (!project) throw new Error("Failed to retrieve created project");
+  return project;
 }
 
 export async function saveProject(project: Project, userId?: string): Promise<Project> {
-  const p = getSupabasePool();
-  if (!p) throw new Error("Database not connected");
-
-  const client = await p.connect();
+  const sb = requireClient();
   const now = nowIso();
 
-  try {
-    await client.query("BEGIN");
+  // Update main project
+  let updateQuery = sb.from("projects").update({
+    status: project.status,
+    financials: project.financials,
+    governance: project.governance,
+    total_billed: project.totalBilled,
+    updated_at: now,
+  }).eq("id", project.id);
+  if (userId) updateQuery = updateQuery.eq("user_id", userId);
 
-    // Update main project
-    const updateQuery = userId
-      ? `UPDATE projects SET status = $1, financials = $2, governance = $3, total_billed = $4, updated_at = $5
-         WHERE id = $6 AND user_id = $7`
-      : `UPDATE projects SET status = $1, financials = $2, governance = $3, total_billed = $4, updated_at = $5
-         WHERE id = $6`;
+  const { error: projErr } = await updateQuery;
+  throwIfError(projErr, "saveProject:project");
 
-    const updateParams = userId
-      ? [project.status, JSON.stringify(project.financials), JSON.stringify(project.governance), project.totalBilled, now, project.id, userId]
-      : [project.status, JSON.stringify(project.financials), JSON.stringify(project.governance), project.totalBilled, now, project.id];
+  // Update brief
+  const { error: briefErr } = await sb.from("project_briefs").update({
+    client_name: project.brief.clientName,
+    description: project.brief.description,
+    industry: project.brief.industry,
+    goals: project.brief.goals,
+    tools: project.brief.tools,
+    budget: project.brief.budget,
+    risk_level: project.brief.riskLevel,
+  }).eq("project_id", project.id);
+  throwIfError(briefErr, "saveProject:brief");
 
-    await client.query(updateQuery, updateParams);
+  // Sync sub-tables: delete + re-insert
+  const subTables = [
+    { table: "project_workflows", data: project.activeWorkflows.map((wf) => ({
+      id: wf.id, project_id: project.id, name: wf.name, description: wf.description,
+      tags: wf.tags, json_url: wf.jsonUrl, complexity: wf.complexity, credentials: wf.credentials,
+      install_plan: wf.installPlan ?? null, deployment: wf.deployment ?? null, created_at: now,
+    }))},
+    { table: "project_documents", data: project.documents.map((doc) => ({
+      id: doc.id, project_id: project.id, name: doc.name, type: doc.type, status: doc.status,
+      content: doc.content, url: doc.url, amount: doc.amount, external_ref: doc.externalRef ?? null,
+      created_at: doc.createdAt,
+    }))},
+    { table: "execution_logs", data: project.executionLogs.slice(-100).map((log) => ({
+      id: log.id, project_id: project.id, workflow_name: log.workflowName, status: log.status,
+      error_details: log.errorDetails, timestamp: log.timestamp, duration: log.duration,
+    }))},
+    { table: "project_incidents", data: project.incidents.map((inc) => ({
+      id: inc.id, project_id: project.id, title: inc.title, severity: inc.severity,
+      status: inc.status, root_cause: inc.rootCause, resolution_plan: inc.resolutionPlan, timestamp: inc.timestamp,
+    }))},
+    { table: "operator_chat", data: project.operatorChat.map((msg) => ({
+      id: msg.id, project_id: project.id, role: msg.role, content: msg.content,
+      tool_call: msg.toolCall ?? null, created_at: now,
+    }))},
+    { table: "crm_activities", data: project.crmActivities.map((act) => ({
+      id: act.id, project_id: project.id, type: act.type, subject: act.subject,
+      status: act.status, timestamp: act.timestamp,
+    }))},
+  ];
 
-    // Update brief
-    await client.query(
-      `UPDATE project_briefs SET
-         client_name = $2, description = $3, industry = $4, goals = $5, tools = $6, budget = $7, risk_level = $8
-       WHERE project_id = $1`,
-      [
-        project.id,
-        project.brief.clientName,
-        project.brief.description,
-        project.brief.industry,
-        project.brief.goals,
-        project.brief.tools,
-        project.brief.budget,
-        project.brief.riskLevel,
-      ]
-    );
-
-    // Sync workflows (replace all)
-    await client.query("DELETE FROM project_workflows WHERE project_id = $1", [project.id]);
-    for (const wf of project.activeWorkflows) {
-      await client.query(
-        `INSERT INTO project_workflows (id, project_id, name, description, tags, json_url, complexity, credentials, install_plan, deployment, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-        [
-          wf.id,
-          project.id,
-          wf.name,
-          wf.description,
-          wf.tags,
-          wf.jsonUrl,
-          wf.complexity,
-          wf.credentials,
-          wf.installPlan ? JSON.stringify(wf.installPlan) : null,
-          wf.deployment ? JSON.stringify(wf.deployment) : null,
-          now,
-        ]
-      );
+  for (const { table, data } of subTables) {
+    const { error: delErr } = await sb.from(table).delete().eq("project_id", project.id);
+    throwIfError(delErr, `saveProject:delete:${table}`);
+    if (data.length > 0) {
+      const { error: insErr } = await sb.from(table).insert(data);
+      throwIfError(insErr, `saveProject:insert:${table}`);
     }
-
-    // Sync documents
-    await client.query("DELETE FROM project_documents WHERE project_id = $1", [project.id]);
-    for (const doc of project.documents) {
-      await client.query(
-        `INSERT INTO project_documents (id, project_id, name, type, status, content, url, amount, external_ref, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-        [
-          doc.id,
-          project.id,
-          doc.name,
-          doc.type,
-          doc.status,
-          doc.content,
-          doc.url,
-          doc.amount,
-          doc.externalRef ? JSON.stringify(doc.externalRef) : null,
-          doc.createdAt,
-        ]
-      );
-    }
-
-    // Sync execution logs (keep last 100)
-    await client.query("DELETE FROM execution_logs WHERE project_id = $1", [project.id]);
-    const logs = project.executionLogs.slice(-100);
-    for (const log of logs) {
-      await client.query(
-        `INSERT INTO execution_logs (id, project_id, workflow_name, status, error_details, timestamp, duration)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-        [log.id, project.id, log.workflowName, log.status, log.errorDetails, log.timestamp, log.duration]
-      );
-    }
-
-    // Sync incidents
-    await client.query("DELETE FROM project_incidents WHERE project_id = $1", [project.id]);
-    for (const inc of project.incidents) {
-      await client.query(
-        `INSERT INTO project_incidents (id, project_id, title, severity, status, root_cause, resolution_plan, timestamp)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-        [inc.id, project.id, inc.title, inc.severity, inc.status, inc.rootCause, inc.resolutionPlan, inc.timestamp]
-      );
-    }
-
-    // Sync operator chat
-    await client.query("DELETE FROM operator_chat WHERE project_id = $1", [project.id]);
-    for (const msg of project.operatorChat) {
-      await client.query(
-        `INSERT INTO operator_chat (id, project_id, role, content, tool_call, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6)`,
-        [msg.id, project.id, msg.role, msg.content, msg.toolCall ? JSON.stringify(msg.toolCall) : null, now]
-      );
-    }
-
-    // Sync CRM activities
-    await client.query("DELETE FROM crm_activities WHERE project_id = $1", [project.id]);
-    for (const act of project.crmActivities) {
-      await client.query(
-        `INSERT INTO crm_activities (id, project_id, type, subject, status, timestamp)
-         VALUES ($1, $2, $3, $4, $5, $6)`,
-        [act.id, project.id, act.type, act.subject, act.status, act.timestamp]
-      );
-    }
-
-    await client.query("COMMIT");
-    return project;
-  } catch (e) {
-    await client.query("ROLLBACK");
-    throw e;
-  } finally {
-    client.release();
   }
+
+  return project;
 }
 
 export async function deleteProject(projectId: string, userId?: string): Promise<void> {
-  const p = getSupabasePool();
-  if (!p) throw new Error("Database not connected");
+  const sb = requireClient();
 
-  const query = userId
-    ? "DELETE FROM projects WHERE id = $1 AND user_id = $2"
-    : "DELETE FROM projects WHERE id = $1";
+  let query = sb.from("projects").delete().eq("id", projectId);
+  if (userId) query = query.eq("user_id", userId);
 
-  const params = userId ? [projectId, userId] : [projectId];
-  await p.query(query, params);
+  const { error } = await query;
+  throwIfError(error, "deleteProject");
 }
 
-function rowToProject(row: Record<string, unknown>): Project {
+function assembleProject(
+  row: Record<string, unknown>,
+  workflows: Record<string, unknown>[],
+  documents: Record<string, unknown>[],
+  executionLogs: Record<string, unknown>[],
+  incidents: Record<string, unknown>[],
+  operatorChat: Record<string, unknown>[],
+  crmActivities: Record<string, unknown>[],
+): Project {
+  // project_briefs comes as an array or object from Supabase join
+  const briefData = Array.isArray(row.project_briefs)
+    ? row.project_briefs[0] ?? {}
+    : row.project_briefs ?? {};
+
   const brief: ProjectBrief = {
     id: String(row.id),
-    clientName: String(row.client_name ?? ""),
-    description: String(row.description ?? ""),
-    industry: row.industry ? String(row.industry) : undefined,
-    goals: Array.isArray(row.goals) ? row.goals : [],
-    tools: Array.isArray(row.tools) ? row.tools : [],
-    budget: String(row.budget ?? ""),
-    riskLevel: (row.risk_level as "Low" | "Medium" | "High") ?? "Low",
+    clientName: String((briefData as Record<string, unknown>).client_name ?? ""),
+    description: String((briefData as Record<string, unknown>).description ?? ""),
+    industry: (briefData as Record<string, unknown>).industry ? String((briefData as Record<string, unknown>).industry) : undefined,
+    goals: Array.isArray((briefData as Record<string, unknown>).goals) ? (briefData as Record<string, unknown>).goals as string[] : [],
+    tools: Array.isArray((briefData as Record<string, unknown>).tools) ? (briefData as Record<string, unknown>).tools as string[] : [],
+    budget: String((briefData as Record<string, unknown>).budget ?? ""),
+    riskLevel: ((briefData as Record<string, unknown>).risk_level as "Low" | "Medium" | "High") ?? "Low",
   };
 
-  const workflows = Array.isArray(row.workflows)
-    ? row.workflows.map((w: Record<string, unknown>) => ({
-        id: String(w.id),
-        name: String(w.name ?? ""),
-        description: String(w.description ?? ""),
-        tags: Array.isArray(w.tags) ? w.tags : [],
-        jsonUrl: String(w.json_url ?? ""),
-        complexity: (w.complexity as "Low" | "Medium" | "High") ?? "Low",
-        credentials: Array.isArray(w.credentials) ? w.credentials : [],
-        installPlan: w.install_plan as Workflow["installPlan"],
-        deployment: w.deployment as Workflow["deployment"],
-      }))
-    : [];
+  const mappedWorkflows: Workflow[] = workflows.map((w) => ({
+    id: String(w.id),
+    name: String(w.name ?? ""),
+    description: String(w.description ?? ""),
+    tags: Array.isArray(w.tags) ? w.tags : [],
+    jsonUrl: String(w.json_url ?? ""),
+    complexity: (w.complexity as "Low" | "Medium" | "High") ?? "Low",
+    credentials: Array.isArray(w.credentials) ? w.credentials : [],
+    installPlan: w.install_plan as Workflow["installPlan"],
+    deployment: w.deployment as Workflow["deployment"],
+  }));
 
-  const documents = Array.isArray(row.documents)
-    ? row.documents.map((d: Record<string, unknown>) => ({
-        id: String(d.id),
-        name: String(d.name ?? ""),
-        type: (d.type as ProjectDocument["type"]) ?? "Report",
-        status: (d.status as ProjectDocument["status"]) ?? "Draft",
-        content: d.content ? String(d.content) : undefined,
-        url: String(d.url ?? ""),
-        amount: d.amount ? Number(d.amount) : undefined,
-        externalRef: d.external_ref as ProjectDocument["externalRef"],
-        createdAt: String(d.created_at ?? nowIso()),
-      }))
-    : [];
+  const mappedDocuments: ProjectDocument[] = documents.map((d) => ({
+    id: String(d.id),
+    name: String(d.name ?? ""),
+    type: (d.type as ProjectDocument["type"]) ?? "Report",
+    status: (d.status as ProjectDocument["status"]) ?? "Draft",
+    content: d.content ? String(d.content) : undefined,
+    url: String(d.url ?? ""),
+    amount: d.amount ? Number(d.amount) : undefined,
+    externalRef: d.external_ref as ProjectDocument["externalRef"],
+    createdAt: String(d.created_at ?? nowIso()),
+  }));
 
-  const executionLogs = Array.isArray(row.execution_logs)
-    ? row.execution_logs.map((l: Record<string, unknown>) => ({
-        id: String(l.id),
-        workflowName: String(l.workflow_name ?? ""),
-        status: (l.status as ExecutionLog["status"]) ?? "Success",
-        errorDetails: l.error_details ? String(l.error_details) : undefined,
-        timestamp: String(l.timestamp ?? nowIso()),
-        duration: String(l.duration ?? "0s"),
-      }))
-    : [];
+  const mappedLogs: ExecutionLog[] = executionLogs.map((l) => ({
+    id: String(l.id),
+    workflowName: String(l.workflow_name ?? ""),
+    status: (l.status as ExecutionLog["status"]) ?? "Success",
+    errorDetails: l.error_details ? String(l.error_details) : undefined,
+    timestamp: String(l.timestamp ?? nowIso()),
+    duration: String(l.duration ?? "0s"),
+  }));
 
-  const incidents = Array.isArray(row.incidents)
-    ? row.incidents.map((i: Record<string, unknown>) => ({
-        id: String(i.id),
-        title: String(i.title ?? ""),
-        severity: (i.severity as ProjectIncident["severity"]) ?? "Low",
-        status: (i.status as ProjectIncident["status"]) ?? "Open",
-        rootCause: i.root_cause ? String(i.root_cause) : undefined,
-        resolutionPlan: i.resolution_plan ? String(i.resolution_plan) : undefined,
-        timestamp: String(i.timestamp ?? nowIso()),
-      }))
-    : [];
+  const mappedIncidents: ProjectIncident[] = incidents.map((i) => ({
+    id: String(i.id),
+    title: String(i.title ?? ""),
+    severity: (i.severity as ProjectIncident["severity"]) ?? "Low",
+    status: (i.status as ProjectIncident["status"]) ?? "Open",
+    rootCause: i.root_cause ? String(i.root_cause) : undefined,
+    resolutionPlan: i.resolution_plan ? String(i.resolution_plan) : undefined,
+    timestamp: String(i.timestamp ?? nowIso()),
+  }));
 
-  const operatorChat = Array.isArray(row.operator_chat)
-    ? row.operator_chat.map((m: Record<string, unknown>) => ({
-        id: String(m.id),
-        role: (m.role as OperatorMessage["role"]) ?? "system",
-        content: String(m.content ?? ""),
-        toolCall: m.tool_call as OperatorMessage["toolCall"],
-      }))
-    : [];
+  const mappedChat: OperatorMessage[] = operatorChat.map((m) => ({
+    id: String(m.id),
+    role: (m.role as OperatorMessage["role"]) ?? "system",
+    content: String(m.content ?? ""),
+    toolCall: m.tool_call as OperatorMessage["toolCall"],
+  }));
 
-  const crmActivities = Array.isArray(row.crm_activities)
-    ? row.crm_activities.map((a: Record<string, unknown>) => ({
-        id: String(a.id),
-        type: (a.type as CRMActivity["type"]) ?? "Note",
-        subject: String(a.subject ?? ""),
-        status: (a.status as CRMActivity["status"]) ?? "Completed",
-        timestamp: String(a.timestamp ?? nowIso()),
-      }))
-    : [];
+  const mappedCrm: CRMActivity[] = crmActivities.map((a) => ({
+    id: String(a.id),
+    type: (a.type as CRMActivity["type"]) ?? "Note",
+    subject: String(a.subject ?? ""),
+    status: (a.status as CRMActivity["status"]) ?? "Completed",
+    timestamp: String(a.timestamp ?? nowIso()),
+  }));
 
   const financials = (row.financials as Project["financials"]) ?? {
-    revenue: 0,
-    expenses: 0,
-    hoursSaved: 0,
-    costPerExecution: 0,
+    revenue: 0, expenses: 0, hoursSaved: 0, costPerExecution: 0,
   };
 
   const governance = (row.governance as Project["governance"]) ?? {
-    certified: false,
-    lastScore: 0,
-    verdict: "None",
+    certified: false, lastScore: 0, verdict: "None",
   };
 
   return {
     id: String(row.id),
     brief,
     status: (row.status as Project["status"]) ?? "Intake",
-    activeWorkflows: workflows,
-    documents,
-    executionLogs,
-    incidents,
-    operatorChat,
-    crmActivities,
+    activeWorkflows: mappedWorkflows,
+    documents: mappedDocuments,
+    executionLogs: mappedLogs,
+    incidents: mappedIncidents,
+    operatorChat: mappedChat,
+    crmActivities: mappedCrm,
     financials,
     governance,
     totalBilled: Number(row.total_billed ?? 0),
@@ -570,107 +439,58 @@ function rowToProject(row: Record<string, unknown>): Project {
 // ============================================
 
 export async function listCouncilSessions(projectId?: string, userId?: string): Promise<CouncilSession[]> {
-  const p = getSupabasePool();
-  if (!p) throw new Error("Database not connected");
+  const sb = requireClient();
 
-  let query = "SELECT * FROM council_sessions";
-  const conditions: string[] = [];
-  const params: unknown[] = [];
+  let query = sb.from("council_sessions").select("*").order("created_at", { ascending: false });
+  if (projectId) query = query.eq("project_id", projectId);
+  if (userId) query = query.eq("user_id", userId);
 
-  if (projectId) {
-    params.push(projectId);
-    conditions.push(`project_id = $${params.length}`);
-  }
-  if (userId) {
-    params.push(userId);
-    conditions.push(`user_id = $${params.length}`);
-  }
-
-  if (conditions.length) {
-    query += " WHERE " + conditions.join(" AND ");
-  }
-  query += " ORDER BY created_at DESC";
-
-  const result = await p.query(query, params);
-  return result.rows.map(rowToCouncilSession);
+  const { data, error } = await query;
+  throwIfError(error, "listCouncilSessions");
+  return (data ?? []).map(rowToCouncilSession);
 }
 
 export async function getCouncilSession(sessionId: string, userId?: string): Promise<CouncilSession | null> {
-  const p = getSupabasePool();
-  if (!p) throw new Error("Database not connected");
+  const sb = requireClient();
 
-  let query = "SELECT * FROM council_sessions WHERE id = $1";
-  const params: unknown[] = [sessionId];
+  let query = sb.from("council_sessions").select("*").eq("id", sessionId);
+  if (userId) query = query.eq("user_id", userId);
 
-  if (userId) {
-    query += " AND user_id = $2";
-    params.push(userId);
-  }
-
-  const result = await p.query(query, params);
-  if (result.rows.length === 0) return null;
-  return rowToCouncilSession(result.rows[0]);
+  const { data, error } = await query.maybeSingle();
+  throwIfError(error, "getCouncilSession");
+  return data ? rowToCouncilSession(data) : null;
 }
 
 export async function saveCouncilSession(session: CouncilSession, userId?: string): Promise<CouncilSession> {
-  const p = getSupabasePool();
-  if (!p) throw new Error("Database not connected");
+  const sb = requireClient();
 
-  await p.query(
-    `INSERT INTO council_sessions (
-       id, user_id, project_id, gate_type, topic, opinions, synthesis, decision, pricing,
-       language, board_name, current_stage, board_summary, next_steps, money_steps,
-       workflow_suggestions, suggested_catalog_query, model_outputs, chairman_model,
-       stage2_rankings, label_to_model, aggregate_rankings, created_at
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
-     ON CONFLICT (id) DO UPDATE SET
-       project_id = EXCLUDED.project_id,
-       gate_type = EXCLUDED.gate_type,
-       topic = EXCLUDED.topic,
-       opinions = EXCLUDED.opinions,
-       synthesis = EXCLUDED.synthesis,
-       decision = EXCLUDED.decision,
-       pricing = EXCLUDED.pricing,
-       language = EXCLUDED.language,
-       board_name = EXCLUDED.board_name,
-       current_stage = EXCLUDED.current_stage,
-       board_summary = EXCLUDED.board_summary,
-       next_steps = EXCLUDED.next_steps,
-       money_steps = EXCLUDED.money_steps,
-       workflow_suggestions = EXCLUDED.workflow_suggestions,
-       suggested_catalog_query = EXCLUDED.suggested_catalog_query,
-       model_outputs = EXCLUDED.model_outputs,
-       chairman_model = EXCLUDED.chairman_model,
-       stage2_rankings = EXCLUDED.stage2_rankings,
-       label_to_model = EXCLUDED.label_to_model,
-       aggregate_rankings = EXCLUDED.aggregate_rankings`,
-    [
-      session.id,
-      userId,
-      session.projectId,
-      session.gateType,
-      session.topic,
-      JSON.stringify(session.opinions),
-      session.synthesis,
-      session.decision,
-      session.pricing ? JSON.stringify(session.pricing) : null,
-      session.language,
-      session.boardName,
-      session.currentStage ? JSON.stringify(session.currentStage) : null,
-      session.boardSummary,
-      session.nextSteps,
-      session.moneySteps,
-      session.workflowSuggestions ? JSON.stringify(session.workflowSuggestions) : null,
-      session.suggestedCatalogQuery ? JSON.stringify(session.suggestedCatalogQuery) : null,
-      session.modelOutputs ? JSON.stringify(session.modelOutputs) : null,
-      session.chairmanModel,
-      session.stage2Rankings ? JSON.stringify(session.stage2Rankings) : null,
-      session.labelToModel ? JSON.stringify(session.labelToModel) : null,
-      session.aggregateRankings ? JSON.stringify(session.aggregateRankings) : null,
-      session.createdAt ?? nowIso(),
-    ]
-  );
+  const { error } = await sb.from("council_sessions").upsert({
+    id: session.id,
+    user_id: userId ?? null,
+    project_id: session.projectId,
+    gate_type: session.gateType,
+    topic: session.topic,
+    opinions: session.opinions,
+    synthesis: session.synthesis,
+    decision: session.decision,
+    pricing: session.pricing ?? null,
+    language: session.language ?? null,
+    board_name: session.boardName ?? null,
+    current_stage: session.currentStage ?? null,
+    board_summary: session.boardSummary ?? null,
+    next_steps: session.nextSteps ?? null,
+    money_steps: session.moneySteps ?? null,
+    workflow_suggestions: session.workflowSuggestions ?? null,
+    suggested_catalog_query: session.suggestedCatalogQuery ?? null,
+    model_outputs: session.modelOutputs ?? null,
+    chairman_model: session.chairmanModel ?? null,
+    stage2_rankings: session.stage2Rankings ?? null,
+    label_to_model: session.labelToModel ?? null,
+    aggregate_rankings: session.aggregateRankings ?? null,
+    created_at: session.createdAt ?? nowIso(),
+  }, { onConflict: "id" });
 
+  throwIfError(error, "saveCouncilSession");
   return session;
 }
 
@@ -729,110 +549,94 @@ export async function createCouncilJob(
   userId?: string,
   projectId?: string
 ): Promise<CouncilJob> {
-  const p = getSupabasePool();
-  if (!p) throw new Error("Database not connected");
-
+  const sb = requireClient();
   const id = generateId("job");
   const now = nowIso();
 
-  await p.query(
-    `INSERT INTO council_jobs (id, user_id, project_id, job_type, status, input, progress, created_at)
-     VALUES ($1, $2, $3, $4, 'pending', $5, 0, $6)`,
-    [id, userId, projectId, jobType, JSON.stringify(input), now]
-  );
-
-  return {
+  const { error } = await sb.from("council_jobs").insert({
     id,
-    userId,
-    projectId,
-    jobType,
+    user_id: userId ?? null,
+    project_id: projectId ?? null,
+    job_type: jobType,
     status: "pending",
     input,
     progress: 0,
-    createdAt: now,
-  };
+    created_at: now,
+  });
+  throwIfError(error, "createCouncilJob");
+
+  return { id, userId, projectId, jobType, status: "pending", input, progress: 0, createdAt: now };
 }
 
 export async function getCouncilJob(jobId: string, userId?: string): Promise<CouncilJob | null> {
-  const p = getSupabasePool();
-  if (!p) throw new Error("Database not connected");
+  const sb = requireClient();
 
-  let query = "SELECT * FROM council_jobs WHERE id = $1";
-  const params: unknown[] = [jobId];
+  let query = sb.from("council_jobs").select("*").eq("id", jobId);
+  if (userId) query = query.eq("user_id", userId);
 
-  if (userId) {
-    query += " AND user_id = $2";
-    params.push(userId);
-  }
-
-  const result = await p.query(query, params);
-  if (result.rows.length === 0) return null;
-  return rowToCouncilJob(result.rows[0]);
+  const { data, error } = await query.maybeSingle();
+  throwIfError(error, "getCouncilJob");
+  return data ? rowToCouncilJob(data) : null;
 }
 
 export async function updateCouncilJob(
   jobId: string,
   update: Partial<Pick<CouncilJob, "status" | "result" | "error" | "progress" | "startedAt" | "completedAt">>
 ): Promise<void> {
-  const p = getSupabasePool();
-  if (!p) throw new Error("Database not connected");
+  const sb = requireClient();
 
-  const sets: string[] = [];
-  const params: unknown[] = [];
-  let idx = 1;
+  const updateObj: Record<string, unknown> = {};
+  if (update.status !== undefined) updateObj.status = update.status;
+  if (update.result !== undefined) updateObj.result = update.result;
+  if (update.error !== undefined) updateObj.error = update.error;
+  if (update.progress !== undefined) updateObj.progress = update.progress;
+  if (update.startedAt !== undefined) updateObj.started_at = update.startedAt;
+  if (update.completedAt !== undefined) updateObj.completed_at = update.completedAt;
 
-  if (update.status !== undefined) {
-    sets.push(`status = $${idx++}`);
-    params.push(update.status);
-  }
-  if (update.result !== undefined) {
-    sets.push(`result = $${idx++}`);
-    params.push(JSON.stringify(update.result));
-  }
-  if (update.error !== undefined) {
-    sets.push(`error = $${idx++}`);
-    params.push(update.error);
-  }
-  if (update.progress !== undefined) {
-    sets.push(`progress = $${idx++}`);
-    params.push(update.progress);
-  }
-  if (update.startedAt !== undefined) {
-    sets.push(`started_at = $${idx++}`);
-    params.push(update.startedAt);
-  }
-  if (update.completedAt !== undefined) {
-    sets.push(`completed_at = $${idx++}`);
-    params.push(update.completedAt);
-  }
+  if (Object.keys(updateObj).length === 0) return;
 
-  if (sets.length === 0) return;
-
-  params.push(jobId);
-  await p.query(`UPDATE council_jobs SET ${sets.join(", ")} WHERE id = $${idx}`, params);
+  const { error } = await sb.from("council_jobs").update(updateObj).eq("id", jobId);
+  throwIfError(error, "updateCouncilJob");
 }
 
 export async function claimNextPendingJob(): Promise<CouncilJob | null> {
-  const p = getSupabasePool();
-  if (!p) throw new Error("Database not connected");
+  const sb = requireClient();
+
+  // Try using RPC function first (for proper FOR UPDATE SKIP LOCKED)
+  try {
+    const { data, error } = await sb.rpc("claim_next_pending_job");
+    if (!error && data && Array.isArray(data) && data.length > 0) {
+      return rowToCouncilJob(data[0]);
+    }
+    if (!error && data && !Array.isArray(data)) {
+      return rowToCouncilJob(data);
+    }
+  } catch {
+    // RPC not available, fall back to non-atomic approach
+  }
+
+  // Fallback: Find oldest pending and update it (not atomic, but functional)
+  const { data: pending } = await sb
+    .from("council_jobs")
+    .select("id")
+    .eq("status", "pending")
+    .order("created_at", { ascending: true })
+    .limit(1)
+    .maybeSingle();
+
+  if (!pending) return null;
 
   const now = nowIso();
-  const result = await p.query(
-    `UPDATE council_jobs
-     SET status = 'processing', started_at = $1
-     WHERE id = (
-       SELECT id FROM council_jobs
-       WHERE status = 'pending'
-       ORDER BY created_at ASC
-       LIMIT 1
-       FOR UPDATE SKIP LOCKED
-     )
-     RETURNING *`,
-    [now]
-  );
+  const { data: claimed, error } = await sb
+    .from("council_jobs")
+    .update({ status: "processing", started_at: now })
+    .eq("id", pending.id)
+    .eq("status", "pending") // Ensure it hasn't been claimed by another worker
+    .select("*")
+    .maybeSingle();
 
-  if (result.rows.length === 0) return null;
-  return rowToCouncilJob(result.rows[0]);
+  if (error || !claimed) return null;
+  return rowToCouncilJob(claimed);
 }
 
 function rowToCouncilJob(row: Record<string, unknown>): CouncilJob {
@@ -857,26 +661,30 @@ function rowToCouncilJob(row: Record<string, unknown>): CouncilJob {
 // ============================================
 
 export async function getAssistantState(userId?: string): Promise<AssistantState | null> {
-  const p = getSupabasePool();
-  if (!p) throw new Error("Database not connected");
+  const sb = requireClient();
 
-  const query = userId
-    ? "SELECT * FROM assistant_state WHERE user_id = $1"
-    : "SELECT * FROM assistant_state WHERE user_id IS NULL";
-  const params = userId ? [userId] : [];
+  let stateQuery = sb.from("assistant_state").select("*");
+  if (userId) {
+    stateQuery = stateQuery.eq("user_id", userId);
+  } else {
+    stateQuery = stateQuery.is("user_id", null);
+  }
 
-  const result = await p.query(query, params);
-  if (result.rows.length === 0) return null;
+  const { data: stateRow, error: stateErr } = await stateQuery.maybeSingle();
+  throwIfError(stateErr, "getAssistantState:state");
+  if (!stateRow) return null;
 
-  const row = result.rows[0];
+  let msgsQuery = sb.from("assistant_messages").select("*").order("created_at", { ascending: true }).limit(300);
+  if (userId) {
+    msgsQuery = msgsQuery.eq("user_id", userId);
+  } else {
+    msgsQuery = msgsQuery.is("user_id", null);
+  }
 
-  // Get messages
-  const messagesQuery = userId
-    ? "SELECT * FROM assistant_messages WHERE user_id = $1 ORDER BY created_at ASC LIMIT 300"
-    : "SELECT * FROM assistant_messages WHERE user_id IS NULL ORDER BY created_at ASC LIMIT 300";
+  const { data: msgs, error: msgsErr } = await msgsQuery;
+  throwIfError(msgsErr, "getAssistantState:messages");
 
-  const messagesResult = await p.query(messagesQuery, params);
-  const messages: AssistantMessage[] = messagesResult.rows.map((m) => ({
+  const messages: AssistantMessage[] = (msgs ?? []).map((m: Record<string, unknown>) => ({
     id: String(m.id),
     role: (m.role as AssistantMessage["role"]) ?? "system",
     content: String(m.content ?? ""),
@@ -885,53 +693,46 @@ export async function getAssistantState(userId?: string): Promise<AssistantState
   }));
 
   return {
-    id: String(row.id),
-    preferences: (row.preferences as AssistantPreferences) ?? {},
+    id: String(stateRow.id),
+    preferences: (stateRow.preferences as AssistantPreferences) ?? {},
     messages,
-    updatedAt: String(row.updated_at ?? nowIso()),
+    updatedAt: String(stateRow.updated_at ?? nowIso()),
   };
 }
 
 export async function saveAssistantState(state: AssistantState, userId?: string): Promise<void> {
-  const p = getSupabasePool();
-  if (!p) throw new Error("Database not connected");
+  const sb = requireClient();
 
-  const client = await p.connect();
+  // Upsert state
+  const { error: stateErr } = await sb.from("assistant_state").upsert({
+    id: state.id,
+    user_id: userId ?? null,
+    preferences: state.preferences,
+    updated_at: state.updatedAt,
+  }, { onConflict: "id" });
+  throwIfError(stateErr, "saveAssistantState:state");
 
-  try {
-    await client.query("BEGIN");
+  // Delete old messages
+  if (userId) {
+    const { error: delErr } = await sb.from("assistant_messages").delete().eq("user_id", userId);
+    throwIfError(delErr, "saveAssistantState:deleteMessages");
+  } else {
+    const { error: delErr } = await sb.from("assistant_messages").delete().is("user_id", null);
+    throwIfError(delErr, "saveAssistantState:deleteMessages");
+  }
 
-    // Upsert state
-    await client.query(
-      `INSERT INTO assistant_state (id, user_id, preferences, updated_at)
-       VALUES ($1, $2, $3, $4)
-       ON CONFLICT (id) DO UPDATE SET
-         preferences = EXCLUDED.preferences,
-         updated_at = EXCLUDED.updated_at`,
-      [state.id, userId, JSON.stringify(state.preferences), state.updatedAt]
-    );
-
-    // Replace messages
-    if (userId) {
-      await client.query("DELETE FROM assistant_messages WHERE user_id = $1", [userId]);
-    } else {
-      await client.query("DELETE FROM assistant_messages WHERE user_id IS NULL");
-    }
-
-    for (const msg of state.messages) {
-      await client.query(
-        `INSERT INTO assistant_messages (id, user_id, role, content, tool_call, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6)`,
-        [msg.id, userId, msg.role, msg.content, msg.toolCall ? JSON.stringify(msg.toolCall) : null, msg.createdAt]
-      );
-    }
-
-    await client.query("COMMIT");
-  } catch (e) {
-    await client.query("ROLLBACK");
-    throw e;
-  } finally {
-    client.release();
+  // Insert new messages
+  if (state.messages.length > 0) {
+    const rows = state.messages.map((msg) => ({
+      id: msg.id,
+      user_id: userId ?? null,
+      role: msg.role,
+      content: msg.content,
+      tool_call: msg.toolCall ?? null,
+      created_at: msg.createdAt,
+    }));
+    const { error: insErr } = await sb.from("assistant_messages").insert(rows);
+    throwIfError(insErr, "saveAssistantState:insertMessages");
   }
 }
 
@@ -940,100 +741,65 @@ export async function saveAssistantState(state: AssistantState, userId?: string)
 // ============================================
 
 export async function listOutboundLeads(userId?: string): Promise<OutboundLead[]> {
-  const p = getSupabasePool();
-  if (!p) throw new Error("Database not connected");
+  const sb = requireClient();
 
-  const query = userId
-    ? "SELECT * FROM outbound_leads WHERE user_id = $1 ORDER BY updated_at DESC"
-    : "SELECT * FROM outbound_leads ORDER BY updated_at DESC";
-  const params = userId ? [userId] : [];
+  let query = sb.from("outbound_leads").select("*").order("updated_at", { ascending: false });
+  if (userId) query = query.eq("user_id", userId);
 
-  const result = await p.query(query, params);
-  return result.rows.map(rowToOutboundLead);
+  const { data, error } = await query;
+  throwIfError(error, "listOutboundLeads");
+  return (data ?? []).map(rowToOutboundLead);
 }
 
 export async function getOutboundLead(leadId: string, userId?: string): Promise<OutboundLead | null> {
-  const p = getSupabasePool();
-  if (!p) throw new Error("Database not connected");
+  const sb = requireClient();
 
-  let query = "SELECT * FROM outbound_leads WHERE id = $1";
-  const params: unknown[] = [leadId];
+  let query = sb.from("outbound_leads").select("*").eq("id", leadId);
+  if (userId) query = query.eq("user_id", userId);
 
-  if (userId) {
-    query += " AND user_id = $2";
-    params.push(userId);
-  }
-
-  const result = await p.query(query, params);
-  if (result.rows.length === 0) return null;
-  return rowToOutboundLead(result.rows[0]);
+  const { data, error } = await query.maybeSingle();
+  throwIfError(error, "getOutboundLead");
+  return data ? rowToOutboundLead(data) : null;
 }
 
 export async function saveOutboundLead(lead: OutboundLead, userId?: string): Promise<OutboundLead> {
-  const p = getSupabasePool();
-  if (!p) throw new Error("Database not connected");
+  const sb = requireClient();
 
-  await p.query(
-    `INSERT INTO outbound_leads (
-       id, user_id, name, category, address, website, phone, maps_url, country, city,
-       stage, notes, last_action_at, next_follow_up_at, source, source_ref, external_ref,
-       project_id, created_at, updated_at
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
-     ON CONFLICT (id) DO UPDATE SET
-       name = EXCLUDED.name,
-       category = EXCLUDED.category,
-       address = EXCLUDED.address,
-       website = EXCLUDED.website,
-       phone = EXCLUDED.phone,
-       maps_url = EXCLUDED.maps_url,
-       country = EXCLUDED.country,
-       city = EXCLUDED.city,
-       stage = EXCLUDED.stage,
-       notes = EXCLUDED.notes,
-       last_action_at = EXCLUDED.last_action_at,
-       next_follow_up_at = EXCLUDED.next_follow_up_at,
-       source = EXCLUDED.source,
-       source_ref = EXCLUDED.source_ref,
-       external_ref = EXCLUDED.external_ref,
-       project_id = EXCLUDED.project_id,
-       updated_at = EXCLUDED.updated_at`,
-    [
-      lead.id,
-      userId,
-      lead.name,
-      lead.category,
-      lead.address,
-      lead.website,
-      lead.phone,
-      lead.mapsUrl,
-      lead.country,
-      lead.city,
-      lead.stage,
-      lead.notes,
-      lead.lastActionAt,
-      lead.nextFollowUpAt,
-      lead.source,
-      lead.sourceRef,
-      lead.externalRef ? JSON.stringify(lead.externalRef) : null,
-      lead.projectId,
-      lead.createdAt,
-      lead.updatedAt,
-    ]
-  );
+  const { error } = await sb.from("outbound_leads").upsert({
+    id: lead.id,
+    user_id: userId ?? null,
+    name: lead.name,
+    category: lead.category ?? null,
+    address: lead.address ?? null,
+    website: lead.website ?? null,
+    phone: lead.phone ?? null,
+    maps_url: lead.mapsUrl ?? null,
+    country: lead.country ?? null,
+    city: lead.city ?? null,
+    stage: lead.stage,
+    notes: lead.notes ?? null,
+    last_action_at: lead.lastActionAt ?? null,
+    next_follow_up_at: lead.nextFollowUpAt ?? null,
+    source: lead.source,
+    source_ref: lead.sourceRef ?? null,
+    external_ref: lead.externalRef ?? null,
+    project_id: lead.projectId ?? null,
+    created_at: lead.createdAt,
+    updated_at: lead.updatedAt,
+  }, { onConflict: "id" });
 
+  throwIfError(error, "saveOutboundLead");
   return lead;
 }
 
 export async function deleteOutboundLead(leadId: string, userId?: string): Promise<void> {
-  const p = getSupabasePool();
-  if (!p) throw new Error("Database not connected");
+  const sb = requireClient();
 
-  const query = userId
-    ? "DELETE FROM outbound_leads WHERE id = $1 AND user_id = $2"
-    : "DELETE FROM outbound_leads WHERE id = $1";
-  const params = userId ? [leadId, userId] : [leadId];
+  let query = sb.from("outbound_leads").delete().eq("id", leadId);
+  if (userId) query = query.eq("user_id", userId);
 
-  await p.query(query, params);
+  const { error } = await query;
+  throwIfError(error, "deleteOutboundLead");
 }
 
 function rowToOutboundLead(row: Record<string, unknown>): OutboundLead {
@@ -1065,26 +831,30 @@ function rowToOutboundLead(row: Record<string, unknown>): OutboundLead {
 // ============================================
 
 export async function getAgencyState(userId?: string): Promise<AgencyState | null> {
-  const p = getSupabasePool();
-  if (!p) throw new Error("Database not connected");
+  const sb = requireClient();
 
-  const query = userId
-    ? "SELECT * FROM agency_state WHERE user_id = $1"
-    : "SELECT * FROM agency_state WHERE user_id IS NULL LIMIT 1";
-  const params = userId ? [userId] : [];
+  let stateQuery = sb.from("agency_state").select("*");
+  if (userId) {
+    stateQuery = stateQuery.eq("user_id", userId);
+  } else {
+    stateQuery = stateQuery.is("user_id", null).limit(1);
+  }
 
-  const result = await p.query(query, params);
-  if (result.rows.length === 0) return null;
+  const { data: stateRow, error: stateErr } = await stateQuery.maybeSingle();
+  throwIfError(stateErr, "getAgencyState:state");
+  if (!stateRow) return null;
 
-  const row = result.rows[0];
+  let docsQuery = sb.from("agency_documents").select("*").order("created_at", { ascending: false });
+  if (userId) {
+    docsQuery = docsQuery.eq("user_id", userId);
+  } else {
+    docsQuery = docsQuery.is("user_id", null);
+  }
 
-  // Get documents
-  const docsQuery = userId
-    ? "SELECT * FROM agency_documents WHERE user_id = $1 ORDER BY created_at DESC"
-    : "SELECT * FROM agency_documents WHERE user_id IS NULL ORDER BY created_at DESC";
+  const { data: docs, error: docsErr } = await docsQuery;
+  throwIfError(docsErr, "getAgencyState:documents");
 
-  const docsResult = await p.query(docsQuery, params);
-  const documents: AgencyDocument[] = docsResult.rows.map((d) => ({
+  const documents: AgencyDocument[] = (docs ?? []).map((d: Record<string, unknown>) => ({
     id: String(d.id),
     type: (d.type as AgencyDocument["type"]) ?? "RevenuePlan",
     name: String(d.name ?? ""),
@@ -1094,65 +864,53 @@ export async function getAgencyState(userId?: string): Promise<AgencyState | nul
   }));
 
   return {
-    goal: (row.goal as AgencyState["goal"]) ?? "ai_agency",
-    completedTaskIds: (row.completed_task_ids as string[]) ?? [],
+    goal: (stateRow.goal as AgencyState["goal"]) ?? "ai_agency",
+    completedTaskIds: (stateRow.completed_task_ids as string[]) ?? [],
     documents,
-    revenueGoal: (row.revenue_goal as AgencyState["revenueGoal"]) ?? {
-      currency: "USD",
-      targetMrr: 0,
-      avgRetainer: 0,
-      closeRatePct: 0,
-      bookingRatePct: 0,
-      updatedAt: nowIso(),
+    revenueGoal: (stateRow.revenue_goal as AgencyState["revenueGoal"]) ?? {
+      currency: "USD", targetMrr: 0, avgRetainer: 0, closeRatePct: 0, bookingRatePct: 0, updatedAt: nowIso(),
     },
-    updatedAt: String(row.updated_at ?? nowIso()),
+    updatedAt: String(stateRow.updated_at ?? nowIso()),
   };
 }
 
 export async function saveAgencyState(state: AgencyState, userId?: string): Promise<void> {
-  const p = getSupabasePool();
-  if (!p) throw new Error("Database not connected");
+  const sb = requireClient();
+  const id = userId ?? "default";
 
-  const client = await p.connect();
+  // Upsert state
+  const { error: stateErr } = await sb.from("agency_state").upsert({
+    id,
+    user_id: userId ?? null,
+    goal: state.goal,
+    completed_task_ids: state.completedTaskIds,
+    revenue_goal: state.revenueGoal,
+    updated_at: state.updatedAt,
+  }, { onConflict: "id" });
+  throwIfError(stateErr, "saveAgencyState:state");
 
-  try {
-    await client.query("BEGIN");
+  // Delete old documents
+  if (userId) {
+    const { error: delErr } = await sb.from("agency_documents").delete().eq("user_id", userId);
+    throwIfError(delErr, "saveAgencyState:deleteDocs");
+  } else {
+    const { error: delErr } = await sb.from("agency_documents").delete().is("user_id", null);
+    throwIfError(delErr, "saveAgencyState:deleteDocs");
+  }
 
-    const id = userId ?? "default";
-
-    // Upsert state
-    await client.query(
-      `INSERT INTO agency_state (id, user_id, goal, completed_task_ids, revenue_goal, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       ON CONFLICT (id) DO UPDATE SET
-         goal = EXCLUDED.goal,
-         completed_task_ids = EXCLUDED.completed_task_ids,
-         revenue_goal = EXCLUDED.revenue_goal,
-         updated_at = EXCLUDED.updated_at`,
-      [id, userId, state.goal, state.completedTaskIds, JSON.stringify(state.revenueGoal), state.updatedAt]
-    );
-
-    // Replace documents
-    if (userId) {
-      await client.query("DELETE FROM agency_documents WHERE user_id = $1", [userId]);
-    } else {
-      await client.query("DELETE FROM agency_documents WHERE user_id IS NULL");
-    }
-
-    for (const doc of state.documents) {
-      await client.query(
-        `INSERT INTO agency_documents (id, user_id, type, name, status, content, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-        [doc.id, userId, doc.type, doc.name, doc.status, doc.content, doc.createdAt]
-      );
-    }
-
-    await client.query("COMMIT");
-  } catch (e) {
-    await client.query("ROLLBACK");
-    throw e;
-  } finally {
-    client.release();
+  // Insert new documents
+  if (state.documents.length > 0) {
+    const rows = state.documents.map((doc) => ({
+      id: doc.id,
+      user_id: userId ?? null,
+      type: doc.type,
+      name: doc.name,
+      status: doc.status,
+      content: doc.content,
+      created_at: doc.createdAt,
+    }));
+    const { error: insErr } = await sb.from("agency_documents").insert(rows);
+    throwIfError(insErr, "saveAgencyState:insertDocs");
   }
 }
 
@@ -1161,113 +919,73 @@ export async function saveAgencyState(state: AgencyState, userId?: string): Prom
 // ============================================
 
 export async function getMarketRadarState(userId?: string): Promise<MarketRadarState | null> {
-  const p = getSupabasePool();
-  if (!p) throw new Error("Database not connected");
+  const sb = requireClient();
 
-  const query = userId
-    ? "SELECT * FROM market_radar_state WHERE user_id = $1"
-    : "SELECT * FROM market_radar_state WHERE user_id IS NULL LIMIT 1";
-  const params = userId ? [userId] : [];
+  let stateQuery = sb.from("market_radar_state").select("*");
+  if (userId) {
+    stateQuery = stateQuery.eq("user_id", userId);
+  } else {
+    stateQuery = stateQuery.is("user_id", null).limit(1);
+  }
 
-  const result = await p.query(query, params);
-  if (result.rows.length === 0) return null;
+  const { data: stateRow, error: stateErr } = await stateQuery.maybeSingle();
+  throwIfError(stateErr, "getMarketRadarState:state");
+  if (!stateRow) return null;
 
-  const row = result.rows[0];
-  const stateId = row.id;
+  const stateId = String(stateRow.id);
 
-  // Get related data
   const [opportunities, youtubeTrends, youtubeIdeas, internetTrends, leads] = await Promise.all([
-    p.query("SELECT * FROM market_opportunities WHERE state_id = $1", [stateId]),
-    p.query("SELECT * FROM market_youtube_trends WHERE state_id = $1", [stateId]),
-    p.query("SELECT * FROM market_youtube_ideas WHERE state_id = $1", [stateId]),
-    p.query("SELECT * FROM market_internet_trends WHERE state_id = $1", [stateId]),
-    p.query("SELECT * FROM market_lead_candidates WHERE state_id = $1", [stateId]),
+    sb.from("market_opportunities").select("*").eq("state_id", stateId),
+    sb.from("market_youtube_trends").select("*").eq("state_id", stateId),
+    sb.from("market_youtube_ideas").select("*").eq("state_id", stateId),
+    sb.from("market_internet_trends").select("*").eq("state_id", stateId),
+    sb.from("market_lead_candidates").select("*").eq("state_id", stateId),
   ]);
 
   return {
-    country: String(row.country ?? ""),
-    city: String(row.city ?? ""),
-    niche: String(row.niche ?? ""),
-    updatedAt: String(row.updated_at ?? nowIso()),
-    opportunities: opportunities.rows.map((o) => o.data as MarketOpportunity),
-    youtubeTrends: youtubeTrends.rows.map((t) => t.data as MarketTrendVideo),
-    youtubeIdeas: youtubeIdeas.rows.map((i) => i.data as MarketVideoIdea),
-    internetTrends: internetTrends.rows.map((t) => t.data as MarketInternetTrend),
-    leads: leads.rows.map((l) => l.data as MarketLeadCandidate),
+    country: String(stateRow.country ?? ""),
+    city: String(stateRow.city ?? ""),
+    niche: String(stateRow.niche ?? ""),
+    updatedAt: String(stateRow.updated_at ?? nowIso()),
+    opportunities: (opportunities.data ?? []).map((o: Record<string, unknown>) => o.data as MarketOpportunity),
+    youtubeTrends: (youtubeTrends.data ?? []).map((t: Record<string, unknown>) => t.data as MarketTrendVideo),
+    youtubeIdeas: (youtubeIdeas.data ?? []).map((i: Record<string, unknown>) => i.data as MarketVideoIdea),
+    internetTrends: (internetTrends.data ?? []).map((t: Record<string, unknown>) => t.data as MarketInternetTrend),
+    leads: (leads.data ?? []).map((l: Record<string, unknown>) => l.data as MarketLeadCandidate),
   };
 }
 
 export async function saveMarketRadarState(state: MarketRadarState, userId?: string): Promise<void> {
-  const p = getSupabasePool();
-  if (!p) throw new Error("Database not connected");
+  const sb = requireClient();
+  const id = userId ?? "default";
 
-  const client = await p.connect();
+  // Upsert main state
+  const { error: stateErr } = await sb.from("market_radar_state").upsert({
+    id,
+    user_id: userId ?? null,
+    country: state.country,
+    city: state.city,
+    niche: state.niche,
+    updated_at: state.updatedAt,
+  }, { onConflict: "id" });
+  throwIfError(stateErr, "saveMarketRadarState:state");
 
-  try {
-    await client.query("BEGIN");
+  // Clear and re-insert sub-tables
+  const subTables = [
+    { table: "market_opportunities", data: state.opportunities.map((opp) => ({ id: opp.id, state_id: id, data: opp })) },
+    { table: "market_youtube_trends", data: state.youtubeTrends.map((t) => ({ id: t.id, state_id: id, data: t })) },
+    { table: "market_youtube_ideas", data: state.youtubeIdeas.map((i) => ({ id: i.id, state_id: id, data: i })) },
+    { table: "market_internet_trends", data: state.internetTrends.map((t) => ({ id: t.id, state_id: id, data: t })) },
+    { table: "market_lead_candidates", data: state.leads.map((l) => ({ id: l.id, state_id: id, data: l })) },
+  ];
 
-    const id = userId ?? "default";
-
-    // Upsert main state
-    await client.query(
-      `INSERT INTO market_radar_state (id, user_id, country, city, niche, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       ON CONFLICT (id) DO UPDATE SET
-         country = EXCLUDED.country,
-         city = EXCLUDED.city,
-         niche = EXCLUDED.niche,
-         updated_at = EXCLUDED.updated_at`,
-      [id, userId, state.country, state.city, state.niche, state.updatedAt]
-    );
-
-    // Clear and re-insert related data
-    await client.query("DELETE FROM market_opportunities WHERE state_id = $1", [id]);
-    await client.query("DELETE FROM market_youtube_trends WHERE state_id = $1", [id]);
-    await client.query("DELETE FROM market_youtube_ideas WHERE state_id = $1", [id]);
-    await client.query("DELETE FROM market_internet_trends WHERE state_id = $1", [id]);
-    await client.query("DELETE FROM market_lead_candidates WHERE state_id = $1", [id]);
-
-    for (const opp of state.opportunities) {
-      await client.query(
-        "INSERT INTO market_opportunities (id, state_id, data) VALUES ($1, $2, $3)",
-        [opp.id, id, JSON.stringify(opp)]
-      );
+  for (const { table, data } of subTables) {
+    const { error: delErr } = await sb.from(table).delete().eq("state_id", id);
+    throwIfError(delErr, `saveMarketRadarState:delete:${table}`);
+    if (data.length > 0) {
+      const { error: insErr } = await sb.from(table).insert(data);
+      throwIfError(insErr, `saveMarketRadarState:insert:${table}`);
     }
-
-    for (const trend of state.youtubeTrends) {
-      await client.query(
-        "INSERT INTO market_youtube_trends (id, state_id, data) VALUES ($1, $2, $3)",
-        [trend.id, id, JSON.stringify(trend)]
-      );
-    }
-
-    for (const idea of state.youtubeIdeas) {
-      await client.query(
-        "INSERT INTO market_youtube_ideas (id, state_id, data) VALUES ($1, $2, $3)",
-        [idea.id, id, JSON.stringify(idea)]
-      );
-    }
-
-    for (const trend of state.internetTrends) {
-      await client.query(
-        "INSERT INTO market_internet_trends (id, state_id, data) VALUES ($1, $2, $3)",
-        [trend.id, id, JSON.stringify(trend)]
-      );
-    }
-
-    for (const lead of state.leads) {
-      await client.query(
-        "INSERT INTO market_lead_candidates (id, state_id, data) VALUES ($1, $2, $3)",
-        [lead.id, id, JSON.stringify(lead)]
-      );
-    }
-
-    await client.query("COMMIT");
-  } catch (e) {
-    await client.query("ROLLBACK");
-    throw e;
-  } finally {
-    client.release();
   }
 }
 
@@ -1276,82 +994,62 @@ export async function saveMarketRadarState(state: MarketRadarState, userId?: str
 // ============================================
 
 export async function getRuntimeSettings(userId?: string): Promise<RuntimeSettings | null> {
-  const p = getSupabasePool();
-  if (!p) throw new Error("Database not connected");
+  const sb = requireClient();
 
-  const query = userId
-    ? "SELECT * FROM runtime_settings WHERE user_id = $1 LIMIT 1"
-    : "SELECT * FROM runtime_settings WHERE user_id IS NULL LIMIT 1";
-  const params = userId ? [userId] : [];
-  const result = await p.query(query, params);
-  if (result.rows.length === 0) return null;
+  let query = sb.from("runtime_settings").select("*").limit(1);
+  if (userId) {
+    query = query.eq("user_id", userId);
+  } else {
+    query = query.is("user_id", null);
+  }
 
-  const row = result.rows[0];
+  const { data, error } = await query.maybeSingle();
+  throwIfError(error, "getRuntimeSettings");
+  if (!data) return null;
+
   return {
-    activeEnvironment: (row.active_environment as EnvironmentName) ?? "Production",
-    n8nBaseUrl: String(row.n8n_base_url ?? "http://localhost:5678"),
-    suitecrmBaseUrl: String(row.suitecrm_base_url ?? "http://localhost:8091"),
-    invoiceshelfBaseUrl: String(row.invoiceshelf_base_url ?? "http://localhost:8090"),
-    documensoBaseUrl: String(row.documenso_base_url ?? "http://localhost:8092"),
-    infisicalBaseUrl: String(row.infisical_base_url ?? "http://localhost:8081"),
-    infisicalWorkspaceId: String(row.infisical_workspace_id ?? ""),
-    infisicalSecretPath: String(row.infisical_secret_path ?? "/"),
-    infisicalEnvDevelopmentSlug: String(row.infisical_env_development_slug ?? "dev"),
-    infisicalEnvStagingSlug: String(row.infisical_env_staging_slug ?? "staging"),
-    infisicalEnvProductionSlug: String(row.infisical_env_production_slug ?? "prod"),
-    councilModels: String(row.council_models ?? ""),
-    councilChairmanModel: String(row.council_chairman_model ?? ""),
-    councilStage2Enabled: Boolean(row.council_stage2_enabled),
+    activeEnvironment: (data.active_environment as EnvironmentName) ?? "Production",
+    n8nBaseUrl: String(data.n8n_base_url ?? "http://localhost:5678"),
+    suitecrmBaseUrl: String(data.suitecrm_base_url ?? "http://localhost:8091"),
+    invoiceshelfBaseUrl: String(data.invoiceshelf_base_url ?? "http://localhost:8090"),
+    documensoBaseUrl: String(data.documenso_base_url ?? "http://localhost:8092"),
+    infisicalBaseUrl: String(data.infisical_base_url ?? "http://localhost:8081"),
+    infisicalWorkspaceId: String(data.infisical_workspace_id ?? ""),
+    infisicalSecretPath: String(data.infisical_secret_path ?? "/"),
+    infisicalEnvDevelopmentSlug: String(data.infisical_env_development_slug ?? "dev"),
+    infisicalEnvStagingSlug: String(data.infisical_env_staging_slug ?? "staging"),
+    infisicalEnvProductionSlug: String(data.infisical_env_production_slug ?? "prod"),
+    councilModels: String(data.council_models ?? ""),
+    councilChairmanModel: String(data.council_chairman_model ?? ""),
+    councilStage2Enabled: Boolean(data.council_stage2_enabled),
   };
 }
 
 export async function saveRuntimeSettings(settings: RuntimeSettings, userId?: string): Promise<void> {
-  const p = getSupabasePool();
-  if (!p) throw new Error("Database not connected");
-
+  const sb = requireClient();
   const id = userId ?? "default";
-  await p.query(
-    `INSERT INTO runtime_settings (
-       id, user_id, active_environment, n8n_base_url, suitecrm_base_url, invoiceshelf_base_url,
-       documenso_base_url, infisical_base_url, infisical_workspace_id, infisical_secret_path,
-       infisical_env_development_slug, infisical_env_staging_slug, infisical_env_production_slug,
-       council_models, council_chairman_model, council_stage2_enabled, updated_at
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, NOW())
-     ON CONFLICT (id) DO UPDATE SET
-       active_environment = EXCLUDED.active_environment,
-       n8n_base_url = EXCLUDED.n8n_base_url,
-       suitecrm_base_url = EXCLUDED.suitecrm_base_url,
-       invoiceshelf_base_url = EXCLUDED.invoiceshelf_base_url,
-       documenso_base_url = EXCLUDED.documenso_base_url,
-       infisical_base_url = EXCLUDED.infisical_base_url,
-       infisical_workspace_id = EXCLUDED.infisical_workspace_id,
-       infisical_secret_path = EXCLUDED.infisical_secret_path,
-       infisical_env_development_slug = EXCLUDED.infisical_env_development_slug,
-       infisical_env_staging_slug = EXCLUDED.infisical_env_staging_slug,
-       infisical_env_production_slug = EXCLUDED.infisical_env_production_slug,
-       council_models = EXCLUDED.council_models,
-       council_chairman_model = EXCLUDED.council_chairman_model,
-       council_stage2_enabled = EXCLUDED.council_stage2_enabled,
-       updated_at = NOW()`,
-    [
-      id,
-      userId ?? null,
-      settings.activeEnvironment,
-      settings.n8nBaseUrl,
-      settings.suitecrmBaseUrl,
-      settings.invoiceshelfBaseUrl,
-      settings.documensoBaseUrl,
-      settings.infisicalBaseUrl,
-      settings.infisicalWorkspaceId,
-      settings.infisicalSecretPath,
-      settings.infisicalEnvDevelopmentSlug,
-      settings.infisicalEnvStagingSlug,
-      settings.infisicalEnvProductionSlug,
-      settings.councilModels,
-      settings.councilChairmanModel,
-      settings.councilStage2Enabled,
-    ]
-  );
+
+  const { error } = await sb.from("runtime_settings").upsert({
+    id,
+    user_id: userId ?? null,
+    active_environment: settings.activeEnvironment,
+    n8n_base_url: settings.n8nBaseUrl,
+    suitecrm_base_url: settings.suitecrmBaseUrl,
+    invoiceshelf_base_url: settings.invoiceshelfBaseUrl,
+    documenso_base_url: settings.documensoBaseUrl,
+    infisical_base_url: settings.infisicalBaseUrl,
+    infisical_workspace_id: settings.infisicalWorkspaceId,
+    infisical_secret_path: settings.infisicalSecretPath,
+    infisical_env_development_slug: settings.infisicalEnvDevelopmentSlug,
+    infisical_env_staging_slug: settings.infisicalEnvStagingSlug,
+    infisical_env_production_slug: settings.infisicalEnvProductionSlug,
+    council_models: settings.councilModels,
+    council_chairman_model: settings.councilChairmanModel,
+    council_stage2_enabled: settings.councilStage2Enabled,
+    updated_at: nowIso(),
+  }, { onConflict: "id" });
+
+  throwIfError(error, "saveRuntimeSettings");
 }
 
 // ============================================
@@ -1359,15 +1057,15 @@ export async function saveRuntimeSettings(settings: RuntimeSettings, userId?: st
 // ============================================
 
 export async function listSecrets(userId?: string): Promise<StoredSecret[]> {
-  const p = getSupabasePool();
-  if (!p) throw new Error("Database not connected");
+  const sb = requireClient();
 
-  const query = userId
-    ? "SELECT * FROM secrets WHERE user_id = $1 ORDER BY last_updated DESC"
-    : "SELECT * FROM secrets ORDER BY last_updated DESC";
-  const params = userId ? [userId] : [];
-  const result = await p.query(query, params);
-  return result.rows.map((row) => ({
+  let query = sb.from("secrets").select("*").order("last_updated", { ascending: false });
+  if (userId) query = query.eq("user_id", userId);
+
+  const { data, error } = await query;
+  throwIfError(error, "listSecrets");
+
+  return (data ?? []).map((row: Record<string, unknown>) => ({
     id: String(row.id),
     key: String(row.key),
     value: String(row.value),
@@ -1377,22 +1075,20 @@ export async function listSecrets(userId?: string): Promise<StoredSecret[]> {
 }
 
 export async function upsertSecret(secret: Omit<StoredSecret, "lastUpdated"> & { lastUpdated?: string }, userId?: string): Promise<StoredSecret> {
-  const p = getSupabasePool();
-  if (!p) throw new Error("Database not connected");
-
+  const sb = requireClient();
   const now = nowIso();
   const id = secret.id ?? generateId("sec");
 
-  await p.query(
-    `INSERT INTO secrets (id, key, value, environment, last_updated, user_id)
-     VALUES ($1, $2, $3, $4, $5, $6)
-     ON CONFLICT (id) DO UPDATE SET
-       key = EXCLUDED.key,
-       value = EXCLUDED.value,
-       environment = EXCLUDED.environment,
-       last_updated = EXCLUDED.last_updated`,
-    [id, secret.key, secret.value, secret.environment, secret.lastUpdated ?? now, userId ?? null]
-  );
+  const { error } = await sb.from("secrets").upsert({
+    id,
+    key: secret.key,
+    value: secret.value,
+    environment: secret.environment,
+    last_updated: secret.lastUpdated ?? now,
+    user_id: userId ?? null,
+  }, { onConflict: "id" });
+
+  throwIfError(error, "upsertSecret");
 
   return {
     id,
@@ -1404,14 +1100,13 @@ export async function upsertSecret(secret: Omit<StoredSecret, "lastUpdated"> & {
 }
 
 export async function deleteSecret(secretId: string, userId?: string): Promise<void> {
-  const p = getSupabasePool();
-  if (!p) throw new Error("Database not connected");
+  const sb = requireClient();
 
-  const query = userId
-    ? "DELETE FROM secrets WHERE id = $1 AND user_id = $2"
-    : "DELETE FROM secrets WHERE id = $1";
-  const params = userId ? [secretId, userId] : [secretId];
-  await p.query(query, params);
+  let query = sb.from("secrets").delete().eq("id", secretId);
+  if (userId) query = query.eq("user_id", userId);
+
+  const { error } = await query;
+  throwIfError(error, "deleteSecret");
 }
 
 // ============================================
@@ -1419,65 +1114,51 @@ export async function deleteSecret(secretId: string, userId?: string): Promise<v
 // ============================================
 
 export async function getAgencyBuilderState(userId?: string): Promise<AgencyBuilderState | null> {
-  const p = getSupabasePool();
-  if (!p) throw new Error("Database not connected");
+  const sb = requireClient();
 
-  const query = userId
-    ? "SELECT * FROM agency_builder_state WHERE user_id = $1"
-    : "SELECT * FROM agency_builder_state WHERE user_id IS NULL LIMIT 1";
-  const params = userId ? [userId] : [];
+  let query = sb.from("agency_builder_state").select("*");
+  if (userId) {
+    query = query.eq("user_id", userId);
+  } else {
+    query = query.is("user_id", null).limit(1);
+  }
 
-  const result = await p.query(query, params);
-  if (result.rows.length === 0) return null;
+  const { data, error } = await query.maybeSingle();
+  throwIfError(error, "getAgencyBuilderState");
+  if (!data) return null;
 
-  const row = result.rows[0];
   return {
-    currentStep: (row.current_step as AgencyBuilderState["currentStep"]) ?? "sector",
-    selectedSectorId: row.selected_sector_id ? String(row.selected_sector_id) : undefined,
-    selectedNicheId: row.selected_niche_id ? String(row.selected_niche_id) : undefined,
-    targetRegion: row.target_region ? String(row.target_region) : undefined,
-    solution: row.solution as AgencyBuilderState["solution"],
-    customizations: row.customizations as AgencyBuilderState["customizations"],
-    deploymentStatus: row.deployment_status as AgencyBuilderState["deploymentStatus"],
-    createdAt: String(row.created_at ?? nowIso()),
-    updatedAt: String(row.updated_at ?? nowIso()),
+    currentStep: (data.current_step as AgencyBuilderState["currentStep"]) ?? "sector",
+    selectedSectorId: data.selected_sector_id ? String(data.selected_sector_id) : undefined,
+    selectedNicheId: data.selected_niche_id ? String(data.selected_niche_id) : undefined,
+    targetRegion: data.target_region ? String(data.target_region) : undefined,
+    solution: data.solution as AgencyBuilderState["solution"],
+    customizations: data.customizations as AgencyBuilderState["customizations"],
+    deploymentStatus: data.deployment_status as AgencyBuilderState["deploymentStatus"],
+    createdAt: String(data.created_at ?? nowIso()),
+    updatedAt: String(data.updated_at ?? nowIso()),
   };
 }
 
 export async function saveAgencyBuilderState(state: AgencyBuilderState, userId?: string): Promise<void> {
-  const p = getSupabasePool();
-  if (!p) throw new Error("Database not connected");
-
+  const sb = requireClient();
   const id = userId ?? "default";
 
-  await p.query(
-    `INSERT INTO agency_builder_state (
-       id, user_id, current_step, selected_sector_id, selected_niche_id, target_region,
-       solution, customizations, deployment_status, created_at, updated_at
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-     ON CONFLICT (id) DO UPDATE SET
-       current_step = EXCLUDED.current_step,
-       selected_sector_id = EXCLUDED.selected_sector_id,
-       selected_niche_id = EXCLUDED.selected_niche_id,
-       target_region = EXCLUDED.target_region,
-       solution = EXCLUDED.solution,
-       customizations = EXCLUDED.customizations,
-       deployment_status = EXCLUDED.deployment_status,
-       updated_at = EXCLUDED.updated_at`,
-    [
-      id,
-      userId,
-      state.currentStep,
-      state.selectedSectorId,
-      state.selectedNicheId,
-      state.targetRegion,
-      state.solution ? JSON.stringify(state.solution) : null,
-      state.customizations ? JSON.stringify(state.customizations) : null,
-      state.deploymentStatus ? JSON.stringify(state.deploymentStatus) : null,
-      state.createdAt,
-      state.updatedAt,
-    ]
-  );
+  const { error } = await sb.from("agency_builder_state").upsert({
+    id,
+    user_id: userId ?? null,
+    current_step: state.currentStep,
+    selected_sector_id: state.selectedSectorId ?? null,
+    selected_niche_id: state.selectedNicheId ?? null,
+    target_region: state.targetRegion ?? null,
+    solution: state.solution ?? null,
+    customizations: state.customizations ?? null,
+    deployment_status: state.deploymentStatus ?? null,
+    created_at: state.createdAt,
+    updated_at: state.updatedAt,
+  }, { onConflict: "id" });
+
+  throwIfError(error, "saveAgencyBuilderState");
 }
 
 // ============================================
@@ -1485,100 +1166,65 @@ export async function saveAgencyBuilderState(state: AgencyBuilderState, userId?:
 // ============================================
 
 export async function listProposals(userId?: string): Promise<Proposal[]> {
-  const p = getSupabasePool();
-  if (!p) throw new Error("Database not connected");
+  const sb = requireClient();
 
-  const query = userId
-    ? "SELECT * FROM proposals WHERE user_id = $1 ORDER BY updated_at DESC"
-    : "SELECT * FROM proposals ORDER BY updated_at DESC";
-  const params = userId ? [userId] : [];
+  let query = sb.from("proposals").select("*").order("updated_at", { ascending: false });
+  if (userId) query = query.eq("user_id", userId);
 
-  const result = await p.query(query, params);
-  return result.rows.map(rowToProposal);
+  const { data, error } = await query;
+  throwIfError(error, "listProposals");
+  return (data ?? []).map(rowToProposal);
 }
 
 export async function getProposal(proposalId: string, userId?: string): Promise<Proposal | null> {
-  const p = getSupabasePool();
-  if (!p) throw new Error("Database not connected");
+  const sb = requireClient();
 
-  let query = "SELECT * FROM proposals WHERE id = $1";
-  const params: unknown[] = [proposalId];
+  let query = sb.from("proposals").select("*").eq("id", proposalId);
+  if (userId) query = query.eq("user_id", userId);
 
-  if (userId) {
-    query += " AND user_id = $2";
-    params.push(userId);
-  }
-
-  const result = await p.query(query, params);
-  if (result.rows.length === 0) return null;
-  return rowToProposal(result.rows[0]);
+  const { data, error } = await query.maybeSingle();
+  throwIfError(error, "getProposal");
+  return data ? rowToProposal(data) : null;
 }
 
 export async function saveProposal(proposal: Proposal, userId?: string): Promise<Proposal> {
-  const p = getSupabasePool();
-  if (!p) throw new Error("Database not connected");
+  const sb = requireClient();
 
-  await p.query(
-    `INSERT INTO proposals (
-       id, user_id, project_id, client_name, client_email, client_company, title, summary,
-       currency, tiers, selected_tier_id, scope, terms, valid_until, status,
-       viewed_at, responded_at, external_ref, created_at, updated_at
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
-     ON CONFLICT (id) DO UPDATE SET
-       project_id = EXCLUDED.project_id,
-       client_name = EXCLUDED.client_name,
-       client_email = EXCLUDED.client_email,
-       client_company = EXCLUDED.client_company,
-       title = EXCLUDED.title,
-       summary = EXCLUDED.summary,
-       currency = EXCLUDED.currency,
-       tiers = EXCLUDED.tiers,
-       selected_tier_id = EXCLUDED.selected_tier_id,
-       scope = EXCLUDED.scope,
-       terms = EXCLUDED.terms,
-       valid_until = EXCLUDED.valid_until,
-       status = EXCLUDED.status,
-       viewed_at = EXCLUDED.viewed_at,
-       responded_at = EXCLUDED.responded_at,
-       external_ref = EXCLUDED.external_ref,
-       updated_at = EXCLUDED.updated_at`,
-    [
-      proposal.id,
-      userId,
-      proposal.projectId,
-      proposal.clientName,
-      proposal.clientEmail,
-      proposal.clientCompany,
-      proposal.title,
-      proposal.summary,
-      proposal.currency,
-      JSON.stringify(proposal.tiers),
-      proposal.selectedTierId,
-      JSON.stringify(proposal.scope),
-      JSON.stringify(proposal.terms),
-      proposal.validUntil,
-      proposal.status,
-      proposal.viewedAt,
-      proposal.respondedAt,
-      proposal.externalRef ? JSON.stringify(proposal.externalRef) : null,
-      proposal.createdAt,
-      proposal.updatedAt,
-    ]
-  );
+  const { error } = await sb.from("proposals").upsert({
+    id: proposal.id,
+    user_id: userId ?? null,
+    project_id: proposal.projectId ?? null,
+    client_name: proposal.clientName,
+    client_email: proposal.clientEmail ?? null,
+    client_company: proposal.clientCompany ?? null,
+    title: proposal.title,
+    summary: proposal.summary,
+    currency: proposal.currency,
+    tiers: proposal.tiers,
+    selected_tier_id: proposal.selectedTierId ?? null,
+    scope: proposal.scope,
+    terms: proposal.terms,
+    valid_until: proposal.validUntil,
+    status: proposal.status,
+    viewed_at: proposal.viewedAt ?? null,
+    responded_at: proposal.respondedAt ?? null,
+    external_ref: proposal.externalRef ?? null,
+    created_at: proposal.createdAt,
+    updated_at: proposal.updatedAt,
+  }, { onConflict: "id" });
 
+  throwIfError(error, "saveProposal");
   return proposal;
 }
 
 export async function deleteProposal(proposalId: string, userId?: string): Promise<void> {
-  const p = getSupabasePool();
-  if (!p) throw new Error("Database not connected");
+  const sb = requireClient();
 
-  const query = userId
-    ? "DELETE FROM proposals WHERE id = $1 AND user_id = $2"
-    : "DELETE FROM proposals WHERE id = $1";
-  const params = userId ? [proposalId, userId] : [proposalId];
+  let query = sb.from("proposals").delete().eq("id", proposalId);
+  if (userId) query = query.eq("user_id", userId);
 
-  await p.query(query, params);
+  const { error } = await query;
+  throwIfError(error, "deleteProposal");
 }
 
 function rowToProposal(row: Record<string, unknown>): Proposal {
@@ -1594,18 +1240,10 @@ function rowToProposal(row: Record<string, unknown>): Proposal {
     tiers: (row.tiers as Proposal["tiers"]) ?? [],
     selectedTierId: row.selected_tier_id ? String(row.selected_tier_id) : undefined,
     scope: (row.scope as Proposal["scope"]) ?? {
-      objectives: [],
-      deliverables: [],
-      timeline: "",
-      assumptions: [],
-      exclusions: [],
+      objectives: [], deliverables: [], timeline: "", assumptions: [], exclusions: [],
     },
     terms: (row.terms as Proposal["terms"]) ?? {
-      paymentTerms: "",
-      validityPeriod: 30,
-      cancellationPolicy: "",
-      revisionPolicy: "",
-      confidentiality: false,
+      paymentTerms: "", validityPeriod: 30, cancellationPolicy: "", revisionPolicy: "", confidentiality: false,
     },
     validUntil: String(row.valid_until ?? nowIso()),
     status: (row.status as Proposal["status"]) ?? "Draft",
@@ -1622,79 +1260,47 @@ function rowToProposal(row: Record<string, unknown>): Proposal {
 // ============================================
 
 export async function listFinancialTransactions(userId?: string, projectId?: string): Promise<FinancialTransaction[]> {
-  const p = getSupabasePool();
-  if (!p) throw new Error("Database not connected");
+  const sb = requireClient();
 
-  let query = "SELECT * FROM financial_transactions";
-  const conditions: string[] = [];
-  const params: unknown[] = [];
+  let query = sb.from("financial_transactions").select("*").order("date", { ascending: false });
+  if (userId) query = query.eq("user_id", userId);
+  if (projectId) query = query.eq("project_id", projectId);
 
-  if (userId) {
-    params.push(userId);
-    conditions.push(`user_id = $${params.length}`);
-  }
-  if (projectId) {
-    params.push(projectId);
-    conditions.push(`project_id = $${params.length}`);
-  }
-
-  if (conditions.length) {
-    query += " WHERE " + conditions.join(" AND ");
-  }
-  query += " ORDER BY date DESC, created_at DESC";
-
-  const result = await p.query(query, params);
-  return result.rows.map(rowToFinancialTransaction);
+  const { data, error } = await query;
+  throwIfError(error, "listFinancialTransactions");
+  return (data ?? []).map(rowToFinancialTransaction);
 }
 
 export async function saveFinancialTransaction(transaction: FinancialTransaction, userId?: string): Promise<FinancialTransaction> {
-  const p = getSupabasePool();
-  if (!p) throw new Error("Database not connected");
+  const sb = requireClient();
 
-  await p.query(
-    `INSERT INTO financial_transactions (
-       id, user_id, type, amount, currency, status, description, project_id,
-       client_name, invoice_ref, date, created_at
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-     ON CONFLICT (id) DO UPDATE SET
-       type = EXCLUDED.type,
-       amount = EXCLUDED.amount,
-       currency = EXCLUDED.currency,
-       status = EXCLUDED.status,
-       description = EXCLUDED.description,
-       project_id = EXCLUDED.project_id,
-       client_name = EXCLUDED.client_name,
-       invoice_ref = EXCLUDED.invoice_ref,
-       date = EXCLUDED.date`,
-    [
-      transaction.id,
-      userId,
-      transaction.type,
-      transaction.amount,
-      transaction.currency,
-      transaction.status,
-      transaction.description,
-      transaction.projectId,
-      transaction.clientName,
-      transaction.invoiceRef,
-      transaction.date,
-      transaction.createdAt,
-    ]
-  );
+  const { error } = await sb.from("financial_transactions").upsert({
+    id: transaction.id,
+    user_id: userId ?? null,
+    type: transaction.type,
+    amount: transaction.amount,
+    currency: transaction.currency,
+    status: transaction.status,
+    description: transaction.description,
+    project_id: transaction.projectId ?? null,
+    client_name: transaction.clientName ?? null,
+    invoice_ref: transaction.invoiceRef ?? null,
+    date: transaction.date,
+    created_at: transaction.createdAt,
+  }, { onConflict: "id" });
 
+  throwIfError(error, "saveFinancialTransaction");
   return transaction;
 }
 
 export async function deleteFinancialTransaction(transactionId: string, userId?: string): Promise<void> {
-  const p = getSupabasePool();
-  if (!p) throw new Error("Database not connected");
+  const sb = requireClient();
 
-  const query = userId
-    ? "DELETE FROM financial_transactions WHERE id = $1 AND user_id = $2"
-    : "DELETE FROM financial_transactions WHERE id = $1";
-  const params = userId ? [transactionId, userId] : [transactionId];
+  let query = sb.from("financial_transactions").delete().eq("id", transactionId);
+  if (userId) query = query.eq("user_id", userId);
 
-  await p.query(query, params);
+  const { error } = await query;
+  throwIfError(error, "deleteFinancialTransaction");
 }
 
 function rowToFinancialTransaction(row: Record<string, unknown>): FinancialTransaction {
